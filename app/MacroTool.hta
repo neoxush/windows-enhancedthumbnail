@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<title>MacroTool Console</title>
+<hta:application id="app"
+    applicationname="MacroTool"
+    border="thin"
+    caption="yes"
+    maximizebutton="yes"
+    minimizebutton="yes"
+    scroll="no"
+    singleinstance="yes"
+    windowstate="normal" />
+<style>
+    * { box-sizing: border-box; }
+    body {
+        font-family: "Segoe UI", Tahoma, sans-serif;
+        font-size: 13px;
+        margin: 0;
+        background: #1e1e2e;
+        color: #e6e6ef;
+        height: 100%;
+    }
+    #wrap { display: flex; flex-direction: column; height: 100vh; }
+    header {
+        background: #2a2a40;
+        padding: 10px 16px;
+        border-bottom: 2px solid #3d3d5c;
+    }
+    header h1 { margin: 0; font-size: 17px; color: #8ab4ff; }
+    header .sub { color: #9a9ab0; font-size: 11px; margin-top: 2px; }
+
+    #main { flex: 1; display: flex; overflow: hidden; }
+    #left { width: 300px; padding: 14px; border-right: 1px solid #3d3d5c; overflow-y: auto; }
+    #right { flex: 1; padding: 14px; overflow-y: auto; }
+
+    .card {
+        background: #26263c;
+        border: 1px solid #3d3d5c;
+        border-radius: 6px;
+        padding: 12px;
+        margin-bottom: 14px;
+    }
+    .card h2 { margin: 0 0 10px 0; font-size: 13px; color: #c8c8e0; text-transform: uppercase; letter-spacing: 1px; }
+
+    label { display: block; margin: 8px 0 3px; color: #a8a8c0; font-size: 12px; }
+    input[type=text], input[type=number], select {
+        width: 100%;
+        padding: 6px 8px;
+        background: #1a1a2a;
+        border: 1px solid #45456a;
+        border-radius: 4px;
+        color: #e6e6ef;
+        font-size: 13px;
+    }
+    .row { display: flex; gap: 8px; }
+    .row > div { flex: 1; }
+
+    button {
+        background: #4266d6;
+        color: #fff;
+        border: none;
+        border-radius: 4px;
+        padding: 7px 12px;
+        font-size: 13px;
+        cursor: pointer;
+        margin-top: 8px;
+    }
+    button:hover { background: #5478e8; }
+    button.secondary { background: #3a3a58; }
+    button.secondary:hover { background: #4a4a70; }
+    button.danger { background: #d64242; }
+    button.danger:hover { background: #e85454; }
+    button.small { padding: 3px 8px; font-size: 11px; margin: 0; }
+
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #33334d; }
+    th { color: #8ab4ff; }
+    tr.sel { background: #354a8c; }
+    tr.clickable { cursor: pointer; }
+    tr.clickable:hover { background: #2f2f4a; }
+
+    #log {
+        background: #12121e;
+        border: 1px solid #3d3d5c;
+        border-radius: 6px;
+        padding: 10px;
+        font-family: Consolas, monospace;
+        font-size: 12px;
+        white-space: pre-wrap;
+        color: #b8f0b8;
+        min-height: 120px;
+        max-height: 200px;
+        overflow-y: auto;
+    }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+    .pill.ok { background: #2d5a2d; color: #b8f0b8; }
+    .pill.warn { background: #5a4a2d; color: #f0e0b8; }
+    .muted { color: #8888a0; }
+    .macro-item { padding: 6px 8px; border-radius: 4px; cursor: pointer; margin-bottom: 3px; background: #1f1f30; }
+    .macro-item:hover { background: #2f2f4a; }
+    .macro-item.sel { background: #354a8c; }
+
+    /* Target-program picker popup */
+    #pickerOverlay {
+        display: none;
+        position: fixed;
+        left: 0; top: 0; width: 100%; height: 100%;
+        background: rgba(0,0,0,0.55);
+        z-index: 1000;
+    }
+    #pickerBox {
+        position: absolute;
+        left: 50%; top: 50%;
+        width: 560px;
+        margin-left: -280px; margin-top: -220px;
+        background: #26263c;
+        border: 1px solid #5478e8;
+        border-radius: 8px;
+        box-shadow: 0 8px 30px rgba(0,0,0,0.6);
+    }
+    #pickerHead {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px 14px;
+        background: #2f2f4a;
+        border-bottom: 1px solid #45456a;
+        border-radius: 8px 8px 0 0;
+        font-size: 14px;
+        color: #8ab4ff;
+    }
+    #pickerClose {
+        cursor: pointer;
+        font-size: 20px;
+        line-height: 1;
+        color: #b0b0c8;
+        padding: 0 4px;
+    }
+    #pickerClose:hover { color: #fff; }
+</style>
+</head>
+<body>
+<div id="wrap">
+    <header>
+        <h1>MacroTool Console</h1>
+        <div class="sub">Record &amp; replay keyboard/mouse macros against a target process (PID) &mdash; powered by PowerShell</div>
+    </header>
+    <div id="main">
+        <div id="left">
+            <div class="card">
+                <h2>1. Target Program</h2>
+                <div class="muted" style="margin-bottom:8px;font-size:11px;">Pick the program you started. The list opens on demand.</div>
+                <button onclick="openPicker()" style="width:100%">Choose target program&hellip;</button>
+                <div style="margin-top:10px;">
+                    <label>Selected target</label>
+                    <input type="text" id="selLabel" readonly placeholder="none selected" />
+                    <input type="hidden" id="pid" />
+                </div>
+            </div>
+
+            <div class="card">
+                <h2>2. Record</h2>
+                <label>Macro name</label>
+                <input type="text" id="recName" value="mymacro" />
+                <label><input type="checkbox" id="noMove" style="width:auto" /> Skip mouse movement</label>
+                <button onclick="startRecord()">Start Recording (F9 to stop)</button>
+                <div class="muted" style="margin-top:6px;font-size:11px;">A recorder window opens; press F9 there to finish.</div>
+            </div>
+        </div>
+
+        <div id="right">
+            <div class="card">
+                <h2>3. Play</h2>
+                <label>Macro</label>
+                <div id="macroList"><span class="muted">Loading...</span></div>
+                <div class="row" style="margin-top:10px;">
+                    <div><label>Delay (s)</label><input type="number" id="delay" value="3" /></div>
+                    <div><label>Repeat (0=inf)</label><input type="number" id="repeat" value="1" /></div>
+                    <div><label>Interval (s)</label><input type="number" id="interval" value="0" /></div>
+                    <div><label>Speed</label><input type="number" id="speed" value="1" step="0.1" /></div>
+                </div>
+                <button onclick="playMacro()">Play against selected PID</button>
+                <button class="secondary" onclick="refreshMacros()">Refresh list</button>
+                <button class="secondary" onclick="openMacroFolder()">Open macro folder</button>
+                <label style="margin-top:10px;">Playback mode</label>
+                <select id="playMode">
+                    <option value="foreground">Foreground (bring target to front) - most reliable</option>
+                    <option value="flash">Flash-restore (focus target, then return to your window)</option>
+                    <option value="background">Background (no focus) - classic Win32 apps only</option>
+                </select>
+                <div class="muted" style="font-size:11px;margin-top:3px;">Foreground: universal. Flash-restore: universal, target flashes briefly then focus returns to you. Background: no flicker but games/DirectX/context menus ignore it.</div>
+            </div>
+
+            <div class="card">
+                <h2>Status Log</h2>
+                <div id="log">Ready.</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div id="pickerOverlay" onclick="overlayClick(event)">
+    <div id="pickerBox">
+        <div id="pickerHead">
+            <span>Choose target program</span>
+            <span id="pickerClose" onclick="closePicker()">&times;</span>
+        </div>
+        <div style="padding:10px 12px;">
+            <div class="row">
+                <div style="flex:2"><input type="text" id="procName" placeholder="Filter (e.g. chrome) - blank = all" onkeyup="if(event.keyCode==13)findWindows()" /></div>
+                <div><button class="small" onclick="findWindows()" style="width:100%">Refresh</button></div>
+            </div>
+            <div id="pidTable" style="margin-top:10px;max-height:340px;overflow-y:auto;"></div>
+        </div>
+    </div>
+</div>
+
+<script language="javascript">
+var fso = new ActiveXObject("Scripting.FileSystemObject");
+var shell = new ActiveXObject("WScript.Shell");
+// Decode %20 etc. so paths with spaces in the install directory work correctly.
+var _rawPath = location.pathname.replace(/^\//, "").replace(/\//g, "\\");
+try { _rawPath = decodeURIComponent(_rawPath); } catch (e) {}
+var scriptDir = fso.GetParentFolderName(_rawPath);
+var ps1 = scriptDir + "\\MacroTool.ps1";
+var macrosDir = scriptDir + "\\macros";
+var selectedMacro = null;
+var macroNames = [];
+
+function log(msg, cls) {
+    var el = document.getElementById("log");
+    var stamp = new Date().toLocaleTimeString();
+    el.innerText = "[" + stamp + "] " + msg + "\n" + el.innerText;
+}
+
+// Append a raw line (from a running job) without a timestamp prefix.
+function logRaw(line) {
+    var el = document.getElementById("log");
+    el.innerText = line + "\n" + el.innerText;
+}
+
+// --- Background job runner: hidden process -> log file -> Status log ---
+var jobTimer = null;
+var jobLogPath = null;
+var jobDonePath = null;
+var jobReadPos = 0;
+
+function runPSLogged(args, label) {
+    if (jobTimer != null) {
+        log("A job is already running; wait for it to finish.", "warn");
+        return;
+    }
+    var tmp = shell.ExpandEnvironmentStrings("%TEMP%");
+    var stamp = new Date().getTime();
+    jobLogPath = tmp + "\\mt_job_" + stamp + ".log";
+    jobDonePath = tmp + "\\mt_job_" + stamp + ".done";
+    jobReadPos = 0;
+
+    // Create empty log so the reader can open it immediately.
+    var f = fso.CreateTextFile(jobLogPath, true);
+    f.Close();
+
+    // Hidden PowerShell: run the tool, tee output to the log, then drop a .done marker.
+    var inner = '& { powershell -NoProfile -ExecutionPolicy Bypass -File \\"' + ps1 + '\\" ' + args +
+                ' *>&1 | Tee-Object -FilePath \\"' + jobLogPath + '\\" ; ' +
+                'Set-Content -LiteralPath \\"' + jobDonePath + '\\" -Value done }';
+    var cmd = 'powershell -NoProfile -ExecutionPolicy Bypass -Command "' + inner + '"';
+    shell.Run(cmd, 0, false);  // 0 = hidden window, false = don't wait
+
+    log(label + " started (output below).");
+    jobTimer = window.setInterval(pollJob, 400);
+}
+
+function pollJob() {
+    try {
+        // Read any new content appended to the log file.
+        if (fso.FileExists(jobLogPath)) {
+            var ts = fso.OpenTextFile(jobLogPath, 1, false);
+            var all = "";
+            if (!ts.AtEndOfStream) { all = ts.ReadAll(); }
+            ts.Close();
+            if (all.length > jobReadPos) {
+                var chunk = all.substring(jobReadPos);
+                jobReadPos = all.length;
+                var lines = chunk.split(/\r?\n/);
+                for (var i = 0; i < lines.length; i++) {
+                    var ln = lines[i];
+                    if (ln && ln.replace(/\s/g, "").length > 0) { logRaw("  " + ln); }
+                }
+            }
+        }
+    } catch (e) { /* file may be momentarily locked; try next tick */ }
+
+    // Finished?
+    if (fso.FileExists(jobDonePath)) {
+        window.clearInterval(jobTimer);
+        jobTimer = null;
+        log("Job finished.");
+        try { fso.DeleteFile(jobLogPath); } catch (e) {}
+        try { fso.DeleteFile(jobDonePath); } catch (e) {}
+        refreshMacros();  // pick up any newly recorded macro
+    }
+}
+
+// Run MacroTool.ps1 and capture stdout synchronously.
+function runPS(args) {
+    var cmd = 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + ps1 + '" ' + args;
+    var exec = shell.Exec(cmd);
+    var out = "";
+    while (exec.Status == 0) {
+        while (!exec.StdOut.AtEndOfStream) { out += exec.StdOut.ReadLine() + "\n"; }
+    }
+    while (!exec.StdOut.AtEndOfStream) { out += exec.StdOut.ReadLine() + "\n"; }
+    return out;
+}
+
+// Launch a command in its own visible window (non-blocking) - for record/play.
+function runPSWindow(args, title) {
+    var cmd = 'cmd /c title ' + title + ' & powershell -NoProfile -ExecutionPolicy Bypass -File "' + ps1 + '" ' + args + ' & echo. & pause';
+    shell.Run(cmd, 1, false);
+}
+
+function findWindows() {
+    var name = document.getElementById("procName").value;
+    log(name ? ("Listing windows matching '" + name + "'...") : "Listing all open program windows...");
+    var arg = name ? (' -ProcName "' + name + '"') : '';
+    var out = runPS('windows' + arg + ' -Json');
+    var rows;
+    try { rows = eval("(" + out + ")"); } catch (e) { rows = []; }
+    if (!rows || rows.length == 0) { rows = []; }
+    var html = '<table><tr><th>Program</th><th>Window</th></tr>';
+    if (rows.length == 0) {
+        html += '<tr><td colspan="2" class="muted">No windows found</td></tr>';
+    } else {
+        for (var i = 0; i < rows.length; i++) {
+            var r = rows[i];
+            var t = (r.title || '');
+            if (t.length > 40) { t = t.substring(0, 39) + '\u2026'; }
+            var fj = ('' + r.friendly).replace(/'/g, "\\'");
+            var tj = ('' + (r.title || '')).replace(/'/g, "\\'");
+            html += '<tr class="clickable" onclick="pickWindow(' + r.pid + ",'" + fj + "','" + tj + "')" + '">' +
+                '<td>' + r.friendly + '</td><td>' + t + '</td></tr>';
+        }
+    }
+    html += '</table>';
+    document.getElementById("pidTable").innerHTML = html;
+    log("Found " + rows.length + " window(s).");
+}
+
+function openPicker() {
+    document.getElementById("pickerOverlay").style.display = "block";
+    findWindows();
+    var pn = document.getElementById("procName");
+    if (pn) { pn.focus(); }
+}
+
+function closePicker() {
+    document.getElementById("pickerOverlay").style.display = "none";
+}
+
+function overlayClick(ev) {
+    // Close only when clicking the dimmed backdrop, not the box.
+    var e = ev || window.event;
+    if (e && e.srcElement && e.srcElement.id == "pickerOverlay") { closePicker(); }
+}
+
+function pickWindow(pid, friendly, title) {
+    document.getElementById("pid").value = pid;
+    var lbl = friendly + (title ? (" - " + title) : "");
+    document.getElementById("selLabel").value = lbl + "  (PID " + pid + ")";
+    log("Selected: " + friendly + " (PID " + pid + ").");
+    closePicker();
+}
+
+function openMacroFolder() {
+    // Ensure the folder exists, then reveal it in Windows Explorer.
+    if (!fso.FolderExists(macrosDir)) {
+        try { fso.CreateFolder(macrosDir); } catch (e) {}
+    }
+    shell.Run('explorer.exe "' + macrosDir + '"', 1, false);
+    log("Opened macro folder: " + macrosDir);
+}
+
+function refreshMacros() {
+    var out = runPS('list -Json');
+    var names;
+    try { names = eval("(" + out + ")"); } catch (e) { names = []; }
+    if (!names) names = [];
+    // Harden: a single result may come back as a bare string.
+    if (typeof names == "string") { names = [names]; }
+    macroNames = names;
+    var el = document.getElementById("macroList");
+    if (names.length == 0) {
+        el.innerHTML = '<span class="muted">No macros yet. Record one first.</span>';
+        selectedMacro = null;
+        return;
+    }
+    var html = "";
+    for (var i = 0; i < names.length; i++) {
+        // Pass only the index to the handler; look the name up from macroNames.
+        // Escape the visible text so special chars render safely.
+        var safe = ('' + names[i]).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        html += '<div class="macro-item" id="m_' + i + '" onclick="selectMacro(' + i + ')">' + safe + '</div>';
+    }
+    el.innerHTML = html;
+    // Convenience: if there's exactly one macro, select it automatically.
+    if (names.length == 1) { selectMacro(0); }
+    else { selectedMacro = null; }  // require an explicit choice when several exist
+}
+
+function selectMacro(idx) {
+    if (idx < 0 || idx >= macroNames.length) { return; }
+    selectedMacro = macroNames[idx];
+    var items = document.getElementById("macroList").getElementsByTagName("div");
+    for (var i = 0; i < items.length; i++) { items[i].className = "macro-item"; }
+    var chosen = document.getElementById("m_" + idx);
+    if (chosen) { chosen.className = "macro-item sel"; }
+    log("Macro '" + selectedMacro + "' selected.");
+}
+
+function startRecord() {
+    var name = document.getElementById("recName").value;
+    if (!name) { log("Enter a macro name first.", "warn"); return; }
+    var noMove = document.getElementById("noMove").checked ? " -NoMove" : "";
+    log("Recording '" + name + "' - perform your actions, then press F9 to stop.");
+    runPSLogged('record -Name "' + name + '"' + noMove, "Recording");
+}
+
+function playMacro() {
+    if (!selectedMacro) { log("Click a macro in the list above to select it first.", "warn"); return; }
+    var pid = document.getElementById("pid").value;
+    if (!pid) { log("Pick a target program from the window list first.", "warn"); return; }
+    var delay = document.getElementById("delay").value || 0;
+    var repeat = document.getElementById("repeat").value || 1;
+    var interval = document.getElementById("interval").value || 0;
+    var speed = document.getElementById("speed").value || 1;
+    var pm = document.getElementById("playMode").value;
+    var flag = "";
+    var mode = "foreground";
+    if (pm == "background") { flag = " -Background"; mode = "background (no focus)"; }
+    else if (pm == "flash") { flag = " -FlashRestore"; mode = "flash-restore"; }
+    log("Playing '" + selectedMacro + "' against PID " + pid + " [" + mode + "] (delay " + delay + "s, repeat " + repeat + ").");
+    runPSLogged('play -Name "' + selectedMacro + '" -TargetPid ' + pid +
+        ' -Delay ' + delay + ' -Repeat ' + repeat + ' -Interval ' + interval + ' -Speed ' + speed + flag,
+        "Playback");
+}
+
+// init
+window.onload = function () {
+    window.resizeTo(920, 640);
+    refreshMacros();
+    log("MacroTool console ready. Script: " + ps1);
+};
+</script>
+</body>
+</html>

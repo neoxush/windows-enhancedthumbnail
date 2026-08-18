@@ -1,0 +1,9 @@
+# Runtime-created macro storage
+macros/
+
+# Temp job artifacts
+*.log
+*.done
+
+# Runtime-created user settings
+settings.json
