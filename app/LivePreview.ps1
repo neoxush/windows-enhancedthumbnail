@@ -1705,7 +1705,49 @@ function New-PreviewWindow {
 
     # Show window and start timer
     $script:openWindowCount++
+
+    # Spawn EVERY preview window (the first one after launch AND each new tab
+    # created via the + button / Ctrl+N) near the mouse cursor so the user can
+    # find it immediately. Subsequent windows get a small cascade offset so tabs
+    # created at the same cursor spot don't perfectly overlap.
+    $wnd.WindowStartupLocation = [System.Windows.WindowStartupLocation]::Manual
     $wnd.Show()
+    try {
+        # After Show(), the PresentationSource is available so we can convert
+        # device pixels (cursor / working area) to WPF DIPs correctly.
+        $cur = [System.Windows.Forms.Cursor]::Position           # device pixels
+        $screen = [System.Windows.Forms.Screen]::FromPoint($cur)
+        $wa = $screen.WorkingArea                                # device pixels
+
+        $src = [System.Windows.PresentationSource]::FromVisual($wnd)
+        $dpiX = 1.0; $dpiY = 1.0
+        if ($null -ne $src) {
+            $dpiX = $src.CompositionTarget.TransformToDevice.M11
+            $dpiY = $src.CompositionTarget.TransformToDevice.M22
+        }
+
+        $w = if ($wnd.ActualWidth  -gt 0) { [double]$wnd.ActualWidth }  else { 320.0 }
+        $h = if ($wnd.ActualHeight -gt 0) { [double]$wnd.ActualHeight } else { 210.0 }
+
+        # Cascade offset for windows after the first (28 device px per step,
+        # wrapping every 6 so it never marches too far off the cursor area).
+        $step = (($script:instanceCounter - 1) % 6)
+        $cascade = $step * 28
+
+        # Center the window on the cursor (device px) + cascade, clamp to the
+        # cursor's monitor working area so it is always fully on-screen.
+        $leftPx = $cur.X - ($w * $dpiX) / 2.0 + $cascade
+        $topPx  = $cur.Y - ($h * $dpiY) / 2.0 + $cascade
+        $maxLeft = $wa.Right  - ($w * $dpiX)
+        $maxTop  = $wa.Bottom - ($h * $dpiY)
+        if ($leftPx -lt $wa.Left) { $leftPx = $wa.Left }
+        if ($topPx  -lt $wa.Top)  { $topPx  = $wa.Top }
+        if ($leftPx -gt $maxLeft) { $leftPx = $maxLeft }
+        if ($topPx  -gt $maxTop)  { $topPx  = $maxTop }
+
+        $wnd.Left = $leftPx / $dpiX
+        $wnd.Top  = $topPx  / $dpiY
+    } catch {}
 
     # Timer for continuous thumbnail updates
     $timer = [System.Windows.Threading.DispatcherTimer]::new()
