@@ -982,22 +982,142 @@ function Set-AutoUiState($ctx, [string]$state) {
 #   "Next run in:   Ns"   -> between-run interval countdown
 #   "Done."               -> handled separately as a finished flash
 # ============================================================
-function Set-AutoTabBadge($ctx, [string]$text, [string]$colorHex) {
-    if (-not $ctx.AutoTabStatus -or -not $ctx.AutoTabBadge) { return }
-    if ([string]::IsNullOrEmpty($text)) {
-        $ctx.AutoTabBadge.Visibility = [System.Windows.Visibility]::Collapsed
-        $ctx.AutoTabStatus.Text = ""
-        return
+function Ensure-CenterBadge($ctx) {
+    # Lazily create the centered-on-canvas countdown overlay. It must be a
+    # separate always-on-top borderless window because the live preview is a DWM
+    # thumbnail composited by the OS ON TOP of all WPF content inside the preview
+    # area - a plain in-canvas TextBlock would be hidden behind it. This child
+    # window layers above the thumbnail so the countdown is visible over a live
+    # preview. Non-activating / non-focusable so it never steals focus or blocks
+    # dragging the window underneath.
+    if ($ctx.CenterBadgeWnd) { return }
+    [xml]$bx = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ShowInTaskbar="False" ShowActivated="False" Topmost="True"
+        SizeToContent="WidthAndHeight" ResizeMode="NoResize" Focusable="False"
+        IsHitTestVisible="False">
+    <Border Name="CB_Border" Background="#CC1E2A44" CornerRadius="10"
+            BorderBrush="#8022AACC" BorderThickness="1" Padding="18,8">
+        <TextBlock Name="CB_Text" Text="" Foreground="#8AE6FF" FontSize="26"
+                   FontWeight="Bold" FontFamily="Consolas"
+                   HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    </Border>
+</Window>
+"@
+    try {
+        $reader = [System.Xml.XmlNodeReader]::new($bx)
+        $w = [System.Windows.Markup.XamlReader]::Load($reader)
+        $w.Owner = $ctx.Window
+        $w.Topmost = $true
+        $ctx.CenterBadgeWnd    = $w
+        $ctx.CenterBadgeText   = $w.FindName("CB_Text")
+        $ctx.CenterBadgeBorder = $w.FindName("CB_Border")
+    } catch {
+        $ctx.CenterBadgeWnd = $null
     }
-    $ctx.AutoTabStatus.Text = $text
+}
+
+function Should-UseCenterBadge($ctx) {
+    # Prefer the centered-on-canvas display when the preview canvas is big enough
+    # to hold it comfortably; otherwise fall back to the small title-bar badge
+    # (e.g. mini mode or a very small window).
+    if (-not $ctx.PreviewBorder) { return $false }
+    $w = [double]$ctx.PreviewBorder.ActualWidth
+    $h = [double]$ctx.PreviewBorder.ActualHeight
+    return ($w -ge 150 -and $h -ge 90)
+}
+
+function Update-CenterBadgePosition($ctx) {
+    # Center the overlay over the preview canvas's on-screen rectangle and keep
+    # its layering in sync with the main window's pin state.
+    $w = $ctx.CenterBadgeWnd
+    if (-not $w -or -not $ctx.CenterBadgeVisible) { return }
+    if (-not $ctx.PreviewBorder) { return }
+    try {
+        $pb = $ctx.PreviewBorder
+        if ($pb.ActualWidth -le 0 -or $pb.ActualHeight -le 0) { return }
+        # Preview center in screen (device) coordinates.
+        $topLeft = $pb.PointToScreen([System.Windows.Point]::new(0, 0))
+        $botRight = $pb.PointToScreen([System.Windows.Point]::new($pb.ActualWidth, $pb.ActualHeight))
+        $centerX = ($topLeft.X + $botRight.X) / 2.0
+        $centerY = ($topLeft.Y + $botRight.Y) / 2.0
+        # Convert device pixels back to WPF DIPs for the overlay's Left/Top.
+        $src = [System.Windows.PresentationSource]::FromVisual($ctx.Window)
+        $dpiX = 1.0; $dpiY = 1.0
+        if ($null -ne $src) {
+            $dpiX = $src.CompositionTarget.TransformToDevice.M11
+            $dpiY = $src.CompositionTarget.TransformToDevice.M22
+        }
+        $w.UpdateLayout()
+        $ow = $w.ActualWidth; $oh = $w.ActualHeight
+        $w.Left = ($centerX / $dpiX) - ($ow / 2.0)
+        $w.Top  = ($centerY / $dpiY) - ($oh / 2.0)
+        $w.Topmost = $true
+    } catch {}
+}
+
+function Hide-CenterBadge($ctx) {
+    $ctx.CenterBadgeVisible = $false
+    if ($ctx.CenterBadgeWnd) {
+        try { $ctx.CenterBadgeWnd.Hide() } catch {}
+    }
+}
+
+# ============================================================
+function Set-AutoTabBadge($ctx, [string]$text, [string]$colorHex) {
+    # Route the live countdown/status to the CENTER-of-canvas overlay when the
+    # canvas is big enough (primary), otherwise the small title-bar badge
+    # (fallback). Both are driven from the same parsed states so behavior stays
+    # identical regardless of which display is used.
+    $empty = [string]::IsNullOrEmpty($text)
+    $brush = $null
     if ($colorHex) {
         try {
-            $ctx.AutoTabStatus.Foreground =
-                [System.Windows.Media.SolidColorBrush]::new(
-                    [System.Windows.Media.ColorConverter]::ConvertFromString($colorHex))
-        } catch {}
+            $brush = [System.Windows.Media.SolidColorBrush]::new(
+                [System.Windows.Media.ColorConverter]::ConvertFromString($colorHex))
+        } catch { $brush = $null }
     }
-    $ctx.AutoTabBadge.Visibility = [System.Windows.Visibility]::Visible
+
+    if ($empty) {
+        # Clear both displays.
+        if ($ctx.AutoTabStatus -and $ctx.AutoTabBadge) {
+            $ctx.AutoTabBadge.Visibility = [System.Windows.Visibility]::Collapsed
+            $ctx.AutoTabStatus.Text = ""
+        }
+        Hide-CenterBadge $ctx
+        return
+    }
+
+    if (Should-UseCenterBadge $ctx) {
+        # CENTER overlay is primary; keep the title-bar badge hidden.
+        if ($ctx.AutoTabStatus -and $ctx.AutoTabBadge) {
+            $ctx.AutoTabBadge.Visibility = [System.Windows.Visibility]::Collapsed
+        }
+        Ensure-CenterBadge $ctx
+        if ($ctx.CenterBadgeWnd) {
+            $ctx.CenterBadgeText.Text = $text
+            if ($brush) { $ctx.CenterBadgeText.Foreground = $brush }
+            if (-not $ctx.CenterBadgeVisible) {
+                try { $ctx.CenterBadgeWnd.Show() } catch {}
+                $ctx.CenterBadgeVisible = $true
+            }
+            Update-CenterBadgePosition $ctx
+            return
+        }
+        # If the overlay could not be created, fall through to the title-bar badge.
+    } else {
+        # Canvas too small: hide the overlay, use the title-bar badge.
+        Hide-CenterBadge $ctx
+    }
+
+    # Title-bar fallback.
+    if ($ctx.AutoTabStatus -and $ctx.AutoTabBadge) {
+        $ctx.AutoTabStatus.Text = $text
+        if ($brush) { $ctx.AutoTabStatus.Foreground = $brush }
+        $ctx.AutoTabBadge.Visibility = [System.Windows.Visibility]::Visible
+    }
 }
 
 function Update-AutoTabBadge($ctx, $lines) {
@@ -1230,6 +1350,10 @@ function New-PreviewWindow {
         AutoTimer       = $null
         IsPinned        = $false
         Timer           = $null
+        CenterBadgeWnd     = $null   # centered-on-canvas countdown overlay window
+        CenterBadgeText    = $null   # its TextBlock
+        CenterBadgeBorder  = $null   # its pill Border
+        CenterBadgeVisible = $false
         TitleBarVisible = $true
         ScaleIndex      = 0
         ScaleFactors    = @(1, 2, 3, 4)
@@ -1571,6 +1695,7 @@ function New-PreviewWindow {
         param($sender, $e)
         $c = $sender.Tag
         if ($null -ne $c.Timer) { $c.Timer.Stop() }
+        if ($c.CenterBadgeWnd) { try { $c.CenterBadgeWnd.Close() } catch {}; $c.CenterBadgeWnd = $null }
         Unregister-Thumbnail $c
         $script:openWindowCount--
         if ($script:openWindowCount -le 0) {
@@ -1588,7 +1713,11 @@ function New-PreviewWindow {
     $timer.Tag = $ctx
     $timer.Add_Tick({
         param($sender, $e)
-        Update-Thumbnail $sender.Tag
+        $c = $sender.Tag
+        Update-Thumbnail $c
+        # Keep the centered countdown overlay following the window (move/resize)
+        # while it is visible. No-op when idle.
+        if ($c.CenterBadgeVisible) { Update-CenterBadgePosition $c }
     })
     $timer.Start()
     $ctx.Timer = $timer
