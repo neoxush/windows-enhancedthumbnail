@@ -138,6 +138,9 @@ if (-not ([System.Management.Automation.PSTypeName]'Win32.Native').Type) {
     [DllImport("user32.dll")]
     public static extern bool IsWindowVisible(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder s, int n);
 
@@ -541,58 +544,65 @@ function Set-ForegroundReliable([IntPtr]$hWnd) {
     #
     # Windows blocks SetForegroundWindow when the calling process is not itself
     # the foreground process (foreground-lock), so a naked call only flashes the
-    # taskbar. We defeat this with the standard, dependency-free combo:
-    #   1. Temporarily zero SPI_SETFOREGROUNDLOCKTIMEOUT (save/restore old value).
-    #   2. Synthesize an ALT key tap so the system thinks the user gave input,
-    #      which grants foreground rights for the next call.
-    #   3. Attach THIS thread's input to the current foreground thread so our
-    #      SetForegroundWindow is honored, then detach.
+    # taskbar. We defeat this with the standard, dependency-free combo, but we
+    # try the LEAST intrusive method first and only escalate if needed, because
+    # the ALT key-tap can trigger menu shortcuts in some apps (e.g. Chrome) when
+    # it coincides with the macro's own injected clicks.
+    #   1. Try SetForegroundWindow after AttachThreadInput (no synthetic keys).
+    #   2. Only if that fails: temporarily zero SPI_SETFOREGROUNDLOCKTIMEOUT and
+    #      retry (still no keys).
+    #   3. Only if that still fails: the ALT key-tap as a last resort.
     # Returns $true if the target ends up foreground.
     if ($hWnd -eq [IntPtr]::Zero) { return $false }
 
+    # Only un-minimize if iconic. Do NOT touch an already-visible window's show
+    # state (avoids disturbing size/position of apps like Chrome).
     if ([Win32.Native]::IsIconic($hWnd)) {
         [void][Win32.Native]::ShowWindow($hWnd, $SW_RESTORE)
-    } else {
-        [void][Win32.Native]::ShowWindow($hWnd, $SW_SHOW)
     }
 
-    # 1. Zero the foreground lock timeout (remember the old value to restore it).
+    # Helper: attach our thread to the current foreground thread, try to activate.
+    $activate = {
+        $curTid = [Win32.Native]::GetCurrentThreadId()
+        $fg = [Win32.Native]::GetForegroundWindow()
+        $tmp = 0
+        $fgTid = [Win32.Native]::GetWindowThreadProcessId($fg, [ref]$tmp)
+        $attached = $false
+        try {
+            if ($curTid -ne 0 -and $fgTid -ne 0 -and $curTid -ne $fgTid) {
+                $attached = [Win32.Native]::AttachThreadInput($curTid, $fgTid, $true)
+            }
+            [void][Win32.Native]::BringWindowToTop($hWnd)
+            [void][Win32.Native]::SetForegroundWindow($hWnd)
+        } finally {
+            if ($attached) { [void][Win32.Native]::AttachThreadInput($curTid, $fgTid, $false) }
+        }
+        Start-Sleep -Milliseconds 60
+        return ([Win32.Native]::GetForegroundWindow() -eq $hWnd)
+    }
+
+    # 1. Least intrusive: attach + activate, no synthetic keys.
+    if (& $activate) { Start-Sleep -Milliseconds 60; return $true }
+
+    # 2. Zero the foreground-lock timeout (save/restore), retry - still no keys.
     $oldTimeout = [uint32]0
     $gotOld = [Win32.Native]::SystemParametersInfo($SPI_GETFOREGROUNDLOCKTIMEOUT, 0, [ref]$oldTimeout, 0)
     $zero = [uint32]0
     [void][Win32.Native]::SystemParametersInfo($SPI_SETFOREGROUNDLOCKTIMEOUT, 0, [ref]$zero, $SPIF_SENDCHANGE)
-
-    # 2. ALT tap (down+up) via SendInput to unlock foreground rights.
-    Send-Inputs @( (New-KeyInput ([uint16]$VK_MENU) $false) )
-    Send-Inputs @( (New-KeyInput ([uint16]$VK_MENU) $true) )
-
-    # 3. Attach our (calling) thread input to the current foreground thread.
-    $curTid = [Win32.Native]::GetCurrentThreadId()
-    $fg = [Win32.Native]::GetForegroundWindow()
-    $tmp = 0
-    $fgTid = [Win32.Native]::GetWindowThreadProcessId($fg, [ref]$tmp)
-
-    $attached = $false
-    try {
-        if ($curTid -ne 0 -and $fgTid -ne 0 -and $curTid -ne $fgTid) {
-            $attached = [Win32.Native]::AttachThreadInput($curTid, $fgTid, $true)
-        }
-        [void][Win32.Native]::BringWindowToTop($hWnd)
-        [void][Win32.Native]::SetForegroundWindow($hWnd)
-    } finally {
-        if ($attached) {
-            [void][Win32.Native]::AttachThreadInput($curTid, $fgTid, $false)
-        }
-    }
-
-    # Restore the original foreground lock timeout.
+    $ok2 = (& $activate)
     if ($gotOld) {
         [void][Win32.Native]::SystemParametersInfo($SPI_SETFOREGROUNDLOCKTIMEOUT, 0, [ref]$oldTimeout, $SPIF_SENDCHANGE)
     }
+    if ($ok2) { Start-Sleep -Milliseconds 60; return $true }
+
+    # 3. Last resort: ALT key-tap to unlock foreground rights, then activate.
+    #    Kept last so it never interferes with normal activation / injected input.
+    Send-Inputs @( (New-KeyInput ([uint16]$VK_MENU) $false) )
+    Send-Inputs @( (New-KeyInput ([uint16]$VK_MENU) $true) )
+    $ok3 = (& $activate)
 
     Start-Sleep -Milliseconds 120
-    $nowFg = [Win32.Native]::GetForegroundWindow()
-    return ($nowFg -eq $hWnd)
+    return ([Win32.Native]::GetForegroundWindow() -eq $hWnd)
 }
 
 function Focus-Pid([int]$targetPid, [IntPtr]$explicitHwnd = [IntPtr]::Zero) {
@@ -1160,6 +1170,7 @@ function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, 
     }
 
     $run = 0
+    $focusFailCount = 0
     while ($true) {
         # Auto-stop checks at the top of each run (covers between-run intervals).
         if (Test-StopSignal) {
@@ -1171,12 +1182,43 @@ function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, 
                 Write-Host "[error] Target process exited. Stopping." -ForegroundColor Red; return
             }
         } else {
-            # Foreground playback needs the target focused to inject. Pass the
-            # explicit target window so we activate exactly the previewed window.
+            # Foreground playback: verify the target is still alive BEFORE we
+            # focus + inject. If the target process died or its window is gone,
+            # abort immediately so we never click blindly into whatever window
+            # happens to sit under the recorded screen coordinates (which could
+            # be another app or the desktop).
+            if (-not (Get-Process -Id $targetPid -ErrorAction SilentlyContinue)) {
+                Write-Host "[error] Target process exited. Stopping (no blind input)." -ForegroundColor Red; return
+            }
+            if ($explicitHwnd -ne [IntPtr]::Zero -and -not [Win32.Native]::IsWindow($explicitHwnd)) {
+                Write-Host "[error] Target window no longer exists. Stopping." -ForegroundColor Red; return
+            }
+            # Focus the target (pass the explicit window so we activate exactly
+            # the previewed window).
             if (-not (Focus-Pid $targetPid $explicitHwnd)) {
                 Write-Host "[error] Could not focus a window for PID $targetPid. Stopping." -ForegroundColor Red
                 return
             }
+            # After focusing, confirm the FOREGROUND window belongs to the target
+            # process. If activation failed and some OTHER app is foreground, DON'T
+            # inject - the clicks would land on the wrong window (this is what
+            # prevents a macro from clicking controls of an unrelated app or the
+            # desktop). We match by PID, not exact hwnd, because apps like Chrome
+            # legitimately move focus among their own top-level/popup windows.
+            $fgNow = [Win32.Native]::GetForegroundWindow()
+            $fgPid = 0
+            [void][Win32.Native]::GetWindowThreadProcessId($fgNow, [ref]$fgPid)
+            if ([int]$fgPid -ne [int]$targetPid) {
+                $focusFailCount++
+                if ($focusFailCount -ge 3) {
+                    Write-Host "[error] Could not bring target to foreground after $focusFailCount tries; stopping to avoid clicking the wrong window." -ForegroundColor Red
+                    return
+                }
+                Write-Host "[warn] Target ($targetPid) is not foreground (foreground PID=$fgPid); skipping this run to avoid clicking the wrong window." -ForegroundColor DarkYellow
+                Start-Sleep -Milliseconds 300
+                continue
+            }
+            $focusFailCount = 0
         }
         $run++
         $tag = if ($repeat) { "$run/$repeat" } else { "$run/inf" }

@@ -289,3 +289,39 @@ Not required for the PowerShell toolkit.
   which breaks the zero-dependency guarantee. Intentionally excluded.
 - **Webpage/DOM automation** — would require a browser extension, CDP debug port,
   or a heavy runtime (Playwright/Selenium). Out of scope.
+
+---
+
+## 版本历史 / Version History
+
+### v1.1.0 (Latest)
+- **修复**：回放时不再因目标窗口失焦而“盲点”——每次运行前校验目标进程/窗口存活，
+  并确认目标已在前台（按 PID 匹配），否则跳过该次运行，避免误点到其它窗口（如导致
+  Chrome 被意外关闭）。
+- **修复**：前台激活改为“最小侵入优先”——先尝试常规激活，仅在失败时才回退到 ALT 唤起，
+  避免 ALT 与宏点击叠加触发目标应用的菜单快捷键；不再对已可见窗口调用 ShowWindow，
+  避免打扰其大小/位置。
+- **修复**：回放 Esc 键时不再误触发自身中止；负向滚轮增量回放不再崩溃。
+- **改进**：可靠地将目标窗口带到前台并在回放后保持聚焦；按键“长按”按系统重复率合成
+  自动重复；录制/回放鼠标滚轮（上/下）。
+- **UX**：Automate 面板打开时自动放大窗口以完整显示（含日志区），关闭时还原；关闭面板
+  时重置设置子面板。
+- 全程零外部依赖（纯 PowerShell + user32.dll）。
+
+- **Fix**: Playback no longer "blind-clicks" when the target loses focus — each
+  run verifies the target process/window is alive and confirms the target is
+  foreground (matched by PID), otherwise it skips the run to avoid clicking the
+  wrong window (which could, e.g., unintentionally close Chrome).
+- **Fix**: Foreground activation is now least-intrusive first — it tries normal
+  activation and only falls back to the ALT key-tap if that fails, so ALT never
+  coincides with the macro's own clicks to trigger menu shortcuts; visible
+  windows are no longer disturbed by ShowWindow.
+- **Fix**: Replaying the Esc key no longer self-aborts; negative wheel-delta
+  scroll replay no longer crashes.
+- **Improved**: Reliably bring the target to the foreground and keep it focused
+  after playback; synthesize key-hold auto-repeat at the system rate; record and
+  replay mouse-wheel scroll (up/down).
+- **UX**: The Automate panel auto-grows the window to show its full content
+  (including the log area) and restores height on close; the Settings sub-panel
+  resets when the panel closes.
+- Zero external dependencies throughout (pure PowerShell + user32.dll).
