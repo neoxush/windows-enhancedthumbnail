@@ -205,6 +205,136 @@ if (-not ([System.Management.Automation.PSTypeName]'Win32.Native').Type) {
 
     [DllImport("user32.dll")]
     public static extern uint MapVirtualKey(uint uCode, uint uMapType);
+
+    // Foreground-focus helpers: needed to defeat Windows' foreground-lock so a
+    // non-foreground process (the hidden MacroTool player) can actually activate
+    // the target window instead of only flashing its taskbar button.
+    [DllImport("user32.dll")]
+    public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref uint pvParam, uint fWinIni);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+"@
+}
+
+# --------------------------------------------------------------------------
+# Wheel capture (zero-dependency, user32.dll only).
+#
+# The mouse wheel is a transient WM_MOUSEWHEEL message, invisible to the
+# GetAsyncKeyState polling the recorder uses for buttons/keys. To capture it
+# without any external dependency, install a WH_MOUSE_LL low-level mouse hook
+# on a dedicated background thread that runs its own message pump. The hook
+# enqueues wheel deltas into a thread-safe queue that the recorder's poll loop
+# drains. Uses only user32.dll P/Invoke - no pip, no modules.
+# --------------------------------------------------------------------------
+if (-not ([System.Management.Automation.PSTypeName]'Win32.WheelHook').Type) {
+    Add-Type -Namespace Win32 -Name WheelHook -UsingNamespace @('System.Threading','System.Collections.Concurrent') -MemberDefinition @"
+    private const int WH_MOUSE_LL   = 14;
+    private const int WM_MOUSEWHEEL  = 0x020A;
+    private const int WM_MOUSEHWHEEL = 0x020E;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSLLHOOKSTRUCT {
+        public int x; public int y;
+        public uint mouseData; public uint flags; public uint time; public IntPtr dwExtraInfo;
+    }
+
+    private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public int ptX; public int ptY; }
+    [DllImport("user32.dll")]
+    private static extern int GetMessage(out MSG lpMsg, IntPtr hWnd, uint min, uint max);
+    [DllImport("user32.dll")]
+    private static extern bool PostThreadMessage(uint idThread, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    // A captured wheel event: dx/dy in wheel notches (120 units = 1 notch),
+    // plus the screen coordinates where it happened and the time (seconds since
+    // the hook started) so the recorder can preserve accurate per-event timing.
+    public struct WheelEvent { public int dx; public int dy; public int x; public int y; public double t; }
+
+    private static IntPtr _hook = IntPtr.Zero;
+    private static HookProc _proc;            // kept alive to avoid GC of the delegate
+    private static System.Threading.Thread _thread;
+    private static uint _threadId;
+    private static readonly System.Diagnostics.Stopwatch _clock = new System.Diagnostics.Stopwatch();
+    private static System.Threading.ManualResetEventSlim _ready;
+    private static readonly System.Collections.Concurrent.ConcurrentQueue<WheelEvent> _queue =
+        new System.Collections.Concurrent.ConcurrentQueue<WheelEvent>();
+
+    private static IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode >= 0) {
+            int msg = wParam.ToInt32();
+            if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL) {
+                MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)System.Runtime.InteropServices.Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                short delta = (short)((data.mouseData >> 16) & 0xFFFF);
+                WheelEvent we = new WheelEvent();
+                we.x = data.x; we.y = data.y;
+                we.t = _clock.Elapsed.TotalSeconds;
+                if (msg == WM_MOUSEWHEEL) { we.dy = delta; we.dx = 0; }
+                else                      { we.dx = delta; we.dy = 0; }
+                _queue.Enqueue(we);
+            }
+        }
+        return CallNextHookEx(_hook, nCode, wParam, lParam);
+    }
+
+    // Install the hook synchronously: returns true only once SetWindowsHookEx has
+    // actually run on the pump thread and succeeded. This removes the race where
+    // early scrolls were lost because Start() returned before the hook existed.
+    public static bool Start() {
+        if (_thread != null) return _hook != IntPtr.Zero;
+        _proc = new HookProc(Callback);
+        _ready = new System.Threading.ManualResetEventSlim(false);
+        _clock.Reset(); _clock.Start();
+        WheelEvent tmp;
+        while (_queue.TryDequeue(out tmp)) { }   // clear any stale events
+        _thread = new System.Threading.Thread(new System.Threading.ThreadStart(delegate {
+            _threadId = GetCurrentThreadId();
+            _hook = SetWindowsHookEx(WH_MOUSE_LL, _proc, GetModuleHandle(null), 0);
+            _ready.Set();   // signal AFTER the hook attempt (success or failure)
+            MSG m;
+            while (GetMessage(out m, IntPtr.Zero, 0, 0) > 0) { /* pump */ }
+            if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
+        }));
+        _thread.IsBackground = true;
+        _thread.Start();
+        _ready.Wait(2000);   // block until the hook is installed (or timeout)
+        return _hook != IntPtr.Zero;
+    }
+
+    public static void Stop() {
+        System.Threading.Thread t = _thread;
+        if (t == null) return;
+        // Ensure the pump thread has reached the point where _threadId is set.
+        if (_ready != null) _ready.Wait(2000);
+        // WM_QUIT = 0x0012 to break the message pump.
+        if (_threadId != 0) PostThreadMessage(_threadId, 0x0012, IntPtr.Zero, IntPtr.Zero);
+        try { t.Join(2000); } catch { }
+        _thread = null; _threadId = 0;
+        _clock.Stop();
+        if (_ready != null) { _ready.Dispose(); _ready = null; }
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    // Drain one queued wheel event. Returns true and fills the out fields if one
+    // was available, false otherwise. 't' is seconds since the hook started.
+    public static bool TryDequeue(out int dx, out int dy, out int x, out int y, out double t) {
+        WheelEvent we;
+        if (_queue.TryDequeue(out we)) { dx = we.dx; dy = we.dy; x = we.x; y = we.y; t = we.t; return true; }
+        dx = 0; dy = 0; x = 0; y = 0; t = 0; return false;
+    }
 "@
 }
 
@@ -222,6 +352,7 @@ $MOUSEEVENTF_RIGHTUP     = 0x0010
 $MOUSEEVENTF_MIDDLEDOWN  = 0x0020
 $MOUSEEVENTF_MIDDLEUP    = 0x0040
 $MOUSEEVENTF_WHEEL       = 0x0800
+$MOUSEEVENTF_HWHEEL      = 0x1000
 
 $KEYEVENTF_KEYUP        = 0x0002
 $KEYEVENTF_SCANCODE     = 0x0008
@@ -238,6 +369,14 @@ $SM_YVIRTUALSCREEN  = 77
 $SM_CXVIRTUALSCREEN = 78
 $SM_CYVIRTUALSCREEN = 79
 $SW_RESTORE  = 9
+$SW_SHOW     = 5
+
+# Foreground-lock defeat constants (see Focus-Pid).
+$SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000
+$SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001
+$SPIF_SENDCHANGE              = 0x2
+$VK_MENU                      = 0x12   # ALT
+$SPI_GETKEYBOARDSPEED         = 0x000A
 
 # Virtual-key code that stops recording. Configurable via the -StopVk parameter
 # (defaults to F9 = 0x78) so users can pick another key when F9 is taken.
@@ -397,32 +536,84 @@ function Get-VisibleWindows {
     return @($found | Sort-Object Friendly, Title)
 }
 
-function Focus-Pid([int]$targetPid) {
-    $hwnds = Get-HwndsForPid $targetPid
-    if ($hwnds.Count -eq 0) { return $false }
-    $hWnd = $hwnds[0].Hwnd
+function Set-ForegroundReliable([IntPtr]$hWnd) {
+    # Force a target window to the foreground from a non-foreground process.
+    #
+    # Windows blocks SetForegroundWindow when the calling process is not itself
+    # the foreground process (foreground-lock), so a naked call only flashes the
+    # taskbar. We defeat this with the standard, dependency-free combo:
+    #   1. Temporarily zero SPI_SETFOREGROUNDLOCKTIMEOUT (save/restore old value).
+    #   2. Synthesize an ALT key tap so the system thinks the user gave input,
+    #      which grants foreground rights for the next call.
+    #   3. Attach THIS thread's input to the current foreground thread so our
+    #      SetForegroundWindow is honored, then detach.
+    # Returns $true if the target ends up foreground.
+    if ($hWnd -eq [IntPtr]::Zero) { return $false }
 
     if ([Win32.Native]::IsIconic($hWnd)) {
         [void][Win32.Native]::ShowWindow($hWnd, $SW_RESTORE)
+    } else {
+        [void][Win32.Native]::ShowWindow($hWnd, $SW_SHOW)
     }
+
+    # 1. Zero the foreground lock timeout (remember the old value to restore it).
+    $oldTimeout = [uint32]0
+    $gotOld = [Win32.Native]::SystemParametersInfo($SPI_GETFOREGROUNDLOCKTIMEOUT, 0, [ref]$oldTimeout, 0)
+    $zero = [uint32]0
+    [void][Win32.Native]::SystemParametersInfo($SPI_SETFOREGROUNDLOCKTIMEOUT, 0, [ref]$zero, $SPIF_SENDCHANGE)
+
+    # 2. ALT tap (down+up) via SendInput to unlock foreground rights.
+    Send-Inputs @( (New-KeyInput ([uint16]$VK_MENU) $false) )
+    Send-Inputs @( (New-KeyInput ([uint16]$VK_MENU) $true) )
+
+    # 3. Attach our (calling) thread input to the current foreground thread.
+    $curTid = [Win32.Native]::GetCurrentThreadId()
     $fg = [Win32.Native]::GetForegroundWindow()
-    $curTid = 0; $tgtTid = 0; $tmp = 0
-    $curTid = [Win32.Native]::GetWindowThreadProcessId($fg, [ref]$tmp)
-    $tgtTid = [Win32.Native]::GetWindowThreadProcessId($hWnd, [ref]$tmp)
+    $tmp = 0
+    $fgTid = [Win32.Native]::GetWindowThreadProcessId($fg, [ref]$tmp)
 
     $attached = $false
     try {
-        if ($curTid -ne 0 -and $tgtTid -ne 0 -and $curTid -ne $tgtTid) {
-            $attached = [Win32.Native]::AttachThreadInput($curTid, $tgtTid, $true)
+        if ($curTid -ne 0 -and $fgTid -ne 0 -and $curTid -ne $fgTid) {
+            $attached = [Win32.Native]::AttachThreadInput($curTid, $fgTid, $true)
         }
         [void][Win32.Native]::BringWindowToTop($hWnd)
         [void][Win32.Native]::SetForegroundWindow($hWnd)
     } finally {
         if ($attached) {
-            [void][Win32.Native]::AttachThreadInput($curTid, $tgtTid, $false)
+            [void][Win32.Native]::AttachThreadInput($curTid, $fgTid, $false)
         }
     }
-    Start-Sleep -Milliseconds 150
+
+    # Restore the original foreground lock timeout.
+    if ($gotOld) {
+        [void][Win32.Native]::SystemParametersInfo($SPI_SETFOREGROUNDLOCKTIMEOUT, 0, [ref]$oldTimeout, $SPIF_SENDCHANGE)
+    }
+
+    Start-Sleep -Milliseconds 120
+    $nowFg = [Win32.Native]::GetForegroundWindow()
+    return ($nowFg -eq $hWnd)
+}
+
+function Focus-Pid([int]$targetPid, [IntPtr]$explicitHwnd = [IntPtr]::Zero) {
+    # Prefer the explicit target window handle (the exact previewed window) so we
+    # activate precisely what the user is automating; fall back to PID lookup.
+    $hWnd = $explicitHwnd
+    if ($hWnd -eq [IntPtr]::Zero) {
+        $hwnds = Get-HwndsForPid $targetPid
+        if ($hwnds.Count -eq 0) { return $false }
+        $hWnd = $hwnds[0].Hwnd
+    }
+
+    $ok = Set-ForegroundReliable $hWnd
+    if (-not $ok) {
+        # One retry - some shells need a second nudge to release the lock.
+        Start-Sleep -Milliseconds 60
+        $ok = Set-ForegroundReliable $hWnd
+    }
+    if (-not $ok) {
+        Write-Host "[warn] Could not bring target to foreground; input may not land. Click the target once if needed." -ForegroundColor DarkYellow
+    }
     return $true
 }
 
@@ -525,6 +716,26 @@ function Move-MouseAbsolute([int]$x, [int]$y) {
     Send-Inputs @( (New-MouseInput $flags $ax $ay) )
 }
 
+function ConvertTo-UInt32Bits([int]$v) {
+    # Reinterpret a signed 32-bit int's bit pattern as a uint32 WITHOUT throwing.
+    # A direct [uint32]$negative cast throws ("value too small"), and
+    # ($v -band 0xFFFFFFFF) stays negative because 0xFFFFFFFF is a signed int.
+    # Masking through int64 yields the correct unsigned bit pattern (e.g.
+    # -120 -> 4294967176) which is what mouseData / wheel deltas require.
+    return [uint32]([int64]$v -band 0xFFFFFFFFL)
+}
+
+function Send-Wheel([int]$dx, [int]$dy) {
+    # Reproduce a recorded wheel notch. mouseData carries the (signed) delta as a
+    # 32-bit bit pattern; vertical uses MOUSEEVENTF_WHEEL, horizontal HWHEEL.
+    if ($dy -ne 0) {
+        Send-Inputs @( (New-MouseInput $MOUSEEVENTF_WHEEL 0 0 (ConvertTo-UInt32Bits $dy)) )
+    }
+    if ($dx -ne 0) {
+        Send-Inputs @( (New-MouseInput $MOUSEEVENTF_HWHEEL 0 0 (ConvertTo-UInt32Bits $dx)) )
+    }
+}
+
 # --------------------------------------------------------------------------
 # Recorder (polling)
 # --------------------------------------------------------------------------
@@ -535,6 +746,15 @@ function Invoke-Record([string]$n, [bool]$recordMoves) {
     Write-Host ("Recording... press {0} to stop." -f (Get-VkName $VK_STOP)) -ForegroundColor Yellow
     $events = New-Object System.Collections.ArrayList
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # Start the low-level wheel hook so scroll (which key-state polling cannot
+    # see) gets captured. Zero external dependencies - user32.dll only. Start()
+    # is synchronous and reports whether the hook actually installed.
+    $wheelOk = [Win32.WheelHook]::Start()
+    if (-not $wheelOk) {
+        Write-Host "[warn] Mouse-wheel hook could not be installed; scroll will not be recorded." -ForegroundColor DarkYellow
+    }
+    try {
 
     # previous states
     $prevBtn = @{ 'left' = $false; 'right' = $false; 'middle' = $false }
@@ -550,6 +770,17 @@ function Invoke-Record([string]$n, [bool]$recordMoves) {
         # stop key (F9)
         if (([Win32.Native]::GetAsyncKeyState($VK_STOP) -band 0x8000) -ne 0) {
             break
+        }
+
+        # mouse wheel (drained from the low-level hook queue). Each notch is 120
+        # units. Use the hook's own capture time so rapid multi-notch scrolls keep
+        # accurate, distinct timings instead of collapsing to one poll tick.
+        $wdx = 0; $wdy = 0; $wx = 0; $wy = 0; $wt = 0.0
+        while ([Win32.WheelHook]::TryDequeue([ref]$wdx, [ref]$wdy, [ref]$wx, [ref]$wy, [ref]$wt)) {
+            [void]$events.Add([ordered]@{
+                t = [math]::Round($wt, 4); type = 'mouse_scroll'
+                dx = $wdx; dy = $wdy; x = $wx; y = $wy
+            })
         }
 
         # mouse buttons
@@ -600,6 +831,11 @@ function Invoke-Record([string]$n, [bool]$recordMoves) {
         Start-Sleep -Milliseconds 8
     }
 
+    } finally {
+        # Always tear down the wheel hook so the background thread/pump exits.
+        [Win32.WheelHook]::Stop()
+    }
+
     Write-Host ("Recording stopped. Captured {0} events." -f $events.Count) -ForegroundColor Green
     if ($events.Count -gt 0) {
         Save-Macro $n $events
@@ -612,27 +848,74 @@ function Invoke-Record([string]$n, [bool]$recordMoves) {
 # --------------------------------------------------------------------------
 # Player
 # --------------------------------------------------------------------------
+function Get-KeyRepeatIntervalMs {
+    # System keyboard repeat rate: SPI_GETKEYBOARDSPEED returns 0 (slow, ~2.5/s)
+    # .. 31 (fast, ~30/s). Map linearly to a per-repeat interval in ms. Fall back
+    # to ~33ms (about 30 repeats/sec) if the query fails.
+    $speed = [uint32]0
+    if ([Win32.Native]::SystemParametersInfo($SPI_GETKEYBOARDSPEED, 0, [ref]$speed, 0)) {
+        # repeats/sec ~= 2.5 + (speed/31)*(30-2.5)
+        $rps = 2.5 + ([double]$speed / 31.0) * 27.5
+        if ($rps -lt 1) { $rps = 1 }
+        return [int](1000.0 / $rps)
+    }
+    return 33
+}
+
 function Invoke-PlayEvents($events, [double]$speed) {
     if ($speed -le 0) { $speed = 1.0 }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
+    # Does this macro itself use Esc? If so, the raw GetAsyncKeyState(Esc) panic
+    # key would false-trigger the instant we INJECT the macro's own Esc, aborting
+    # playback immediately (this is the classic "macro does nothing" symptom).
+    # When the macro contains Esc events we rely solely on the -StopFile signal
+    # (used by the UI Stop button) for aborting, which never collides with
+    # injected input.
+    $macroUsesEsc = $false
     foreach ($ev in $events) {
-        # abort on Esc OR stop-file (focus-independent kill signal)
-        if ((([Win32.Native]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0) -or (Test-StopSignal)) {
+        if ($ev.type -eq 'key' -and [int]$ev.vk -eq 0x1B) { $macroUsesEsc = $true; break }
+    }
+    $escAbortEnabled = -not $macroUsesEsc
+
+    # Key-hold support: recorded holds are a single down event then a delayed up
+    # event. Injected input produces no OS auto-repeat, so message-driven apps
+    # would see one keystroke instead of a hold. We synthesize repeats: track
+    # currently-held keys and, during the wait before each event, re-inject
+    # KEYDOWN for held keys at the system repeat interval.
+    $heldKeys = @{}                      # vk -> $true while held
+    $repeatIntervalMs = Get-KeyRepeatIntervalMs
+    $nextRepeatMs = $repeatIntervalMs
+
+    for ($ei = 0; $ei -lt $events.Count; $ei++) {
+        $ev = $events[$ei]
+        # abort on Esc (only when the macro doesn't use Esc itself) OR stop-file.
+        if (($escAbortEnabled -and (([Win32.Native]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0)) -or (Test-StopSignal)) {
             Write-Host "Aborted." -ForegroundColor Red
             return $false
         }
         $target = ($ev.t / $speed) * 1000.0
         while ($sw.Elapsed.TotalMilliseconds -lt $target) {
-            if ((([Win32.Native]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0) -or (Test-StopSignal)) {
+            if (($escAbortEnabled -and (([Win32.Native]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0)) -or (Test-StopSignal)) {
                 Write-Host "Aborted." -ForegroundColor Red
                 return $false
+            }
+            # Emit auto-repeat KEYDOWNs for any keys currently held down.
+            if ($heldKeys.Count -gt 0 -and $sw.Elapsed.TotalMilliseconds -ge $nextRepeatMs) {
+                foreach ($hvk in @($heldKeys.Keys)) {
+                    Send-Inputs @( (New-KeyInput ([uint16]$hvk) $false) )  # $false = key DOWN
+                }
+                $nextRepeatMs = $sw.Elapsed.TotalMilliseconds + $repeatIntervalMs
             }
             Start-Sleep -Milliseconds 2
         }
 
         switch ($ev.type) {
             'mouse_move'  { Move-MouseAbsolute $ev.x $ev.y }
+            'mouse_scroll' {
+                Move-MouseAbsolute $ev.x $ev.y
+                Send-Wheel ([int]$ev.dx) ([int]$ev.dy)
+            }
             'mouse_click' {
                 Move-MouseAbsolute $ev.x $ev.y
                 $down = $ev.pressed
@@ -644,9 +927,23 @@ function Invoke-PlayEvents($events, [double]$speed) {
                 Send-Inputs @( (New-MouseInput $f) )
             }
             'key' {
-                Send-Inputs @( (New-KeyInput ([uint16]$ev.vk) (-not $ev.pressed)) )
+                $vk = [int]$ev.vk
+                Send-Inputs @( (New-KeyInput ([uint16]$vk) (-not $ev.pressed)) )
+                if ($ev.pressed) {
+                    $heldKeys[$vk] = $true
+                    # Reset the repeat clock so the first auto-repeat honors the
+                    # system's initial repeat delay from this fresh press.
+                    $nextRepeatMs = $sw.Elapsed.TotalMilliseconds + $repeatIntervalMs
+                } else {
+                    [void]$heldKeys.Remove($vk)
+                }
             }
         }
+    }
+
+    # Safety: release any keys still marked held (macro ended mid-hold).
+    foreach ($hvk in @($heldKeys.Keys)) {
+        Send-Inputs @( (New-KeyInput ([uint16]$hvk) $true) )  # $true = key UP
     }
     return $true
 }
@@ -665,6 +962,8 @@ $WM_MBUTTONUP   = 0x0208
 $WM_KEYDOWN     = 0x0100
 $WM_KEYUP       = 0x0101
 $WM_CHAR        = 0x0102
+$WM_MOUSEWHEEL  = 0x020A
+$WM_MOUSEHWHEEL = 0x020E
 $MAPVK_VK_TO_CHAR = 2
 $MK_LBUTTON     = 0x0001
 $MK_RBUTTON     = 0x0002
@@ -722,13 +1021,21 @@ function Invoke-PlayEventsBackground($events, [double]$speed, [IntPtr]$hWnd) {
     # If the macro has no mouse events, fall back to an editable child control.
     $keyTarget = Find-EditableChild $hWnd
 
+    # See Invoke-PlayEvents: disable the raw Esc panic key when the macro itself
+    # injects Esc, otherwise playback aborts on its own injected keystroke.
+    $macroUsesEsc = $false
     foreach ($ev in $events) {
-        if ((([Win32.Native]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0) -or (Test-StopSignal)) {
+        if ($ev.type -eq 'key' -and [int]$ev.vk -eq 0x1B) { $macroUsesEsc = $true; break }
+    }
+    $escAbortEnabled = -not $macroUsesEsc
+
+    foreach ($ev in $events) {
+        if (($escAbortEnabled -and (([Win32.Native]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0)) -or (Test-StopSignal)) {
             Write-Host "Aborted." -ForegroundColor Red; return $false
         }
         $target = ($ev.t / $speed) * 1000.0
         while ($sw.Elapsed.TotalMilliseconds -lt $target) {
-            if ((([Win32.Native]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0) -or (Test-StopSignal)) {
+            if (($escAbortEnabled -and (([Win32.Native]::GetAsyncKeyState(0x1B) -band 0x8000) -ne 0)) -or (Test-StopSignal)) {
                 Write-Host "Aborted." -ForegroundColor Red; return $false
             }
             Start-Sleep -Milliseconds 2
@@ -740,6 +1047,21 @@ function Invoke-PlayEventsBackground($events, [double]$speed, [IntPtr]$hWnd) {
                 $keyTarget = $child
                 $c = Get-ClientPoint $child $ev.x $ev.y
                 [void][Win32.Native]::PostMessage($child, $WM_MOUSEMOVE, [IntPtr]0, (New-LParamXY $c.X $c.Y))
+            }
+            'mouse_scroll' {
+                $child = Get-DeepChildAt $hWnd $ev.x $ev.y
+                $keyTarget = $child
+                # WM_MOUSEWHEEL/HWHEEL uses SCREEN coords in lParam (not client),
+                # and packs the signed wheel delta in the HIWORD of wParam.
+                $lp = New-LParamXY $ev.x $ev.y
+                if ([int]$ev.dy -ne 0) {
+                    $wp = [IntPtr]([int64](([int]$ev.dy -band 0xFFFF) -shl 16))
+                    [void][Win32.Native]::PostMessage($child, $WM_MOUSEWHEEL, $wp, $lp)
+                }
+                if ([int]$ev.dx -ne 0) {
+                    $wp = [IntPtr]([int64](([int]$ev.dx -band 0xFFFF) -shl 16))
+                    [void][Win32.Native]::PostMessage($child, $WM_MOUSEHWHEEL, $wp, $lp)
+                }
             }
             'mouse_click' {
                 $child = Get-DeepChildAt $hWnd $ev.x $ev.y
@@ -801,7 +1123,7 @@ function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, 
     $macro = Load-Macro $n
     $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
     if (-not $proc) { Write-Host "[error] PID $targetPid not found." -ForegroundColor Red; return }
-    $modeLabel = if ($background) { 'BACKGROUND (no focus)' } elseif ($flashRestore) { 'FLASH-RESTORE (focus target, restore your window)' } else { 'foreground' }
+    $modeLabel = if ($background) { 'BACKGROUND (no focus)' } else { 'FOREGROUND (focus target, keep it in front)' }
     Write-Host ("Target: PID {0} ({1})  Mode: {2}" -f $targetPid, $proc.ProcessName, $modeLabel)
 
     $bgHwnd = [IntPtr]::Zero
@@ -821,12 +1143,10 @@ function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, 
         Write-Host "Note: many apps (games/DirectX/Chromium canvas, context menus) may ignore posted input." -ForegroundColor DarkYellow
     }
 
-    # Snapshot the window that was in front BEFORE we started, so flash-restore
-    # can return focus there after all runs finish.
-    $priorFg = [IntPtr]::Zero
-    if ($flashRestore) {
-        $priorFg = [Win32.Native]::GetForegroundWindow()
-    }
+    # Post-playback focus policy: we KEEP the target window in front so the user
+    # can immediately keep working in the automated program (they launched Play
+    # from the LivePreview overlay and want the program focused afterwards, not
+    # the overlay). No prior-foreground snapshot / restore is needed.
 
     if ($delay -gt 0) { Show-Countdown $delay "Starting in" }
 
@@ -844,7 +1164,6 @@ function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, 
         # Auto-stop checks at the top of each run (covers between-run intervals).
         if (Test-StopSignal) {
             Write-Host "Auto-stopped (safety trigger)." -ForegroundColor Yellow
-            if ($flashRestore) { Restore-Foreground $priorFg }
             return
         }
         if ($background) {
@@ -852,8 +1171,9 @@ function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, 
                 Write-Host "[error] Target process exited. Stopping." -ForegroundColor Red; return
             }
         } else {
-            # Both foreground and flash-restore need the target focused to inject.
-            if (-not (Focus-Pid $targetPid)) {
+            # Foreground playback needs the target focused to inject. Pass the
+            # explicit target window so we activate exactly the previewed window.
+            if (-not (Focus-Pid $targetPid $explicitHwnd)) {
                 Write-Host "[error] Could not focus a window for PID $targetPid. Stopping." -ForegroundColor Red
                 return
             }
@@ -867,17 +1187,12 @@ function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, 
             $ok = Invoke-PlayEvents $macro.events $speed
         }
         if (-not $ok) {
-            if ($flashRestore) { Restore-Foreground $priorFg }
             return
         }
         if ($repeat -and $run -ge $repeat) { break }
         if ($interval -gt 0) { Show-Countdown $interval "Next run in" }
     }
 
-    if ($flashRestore -and $priorFg -ne [IntPtr]::Zero) {
-        Restore-Foreground $priorFg
-        Write-Host "Focus restored to your previous window." -ForegroundColor DarkGray
-    }
     Write-Host "Done." -ForegroundColor Green
 }
 

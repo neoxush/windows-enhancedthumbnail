@@ -467,8 +467,8 @@ public class NativeMethods {
 
                     <TextBlock Text="Playback mode" Foreground="#999999" FontSize="10"/>
                     <ComboBox Name="AutoMode" Height="22" FontSize="11" Margin="0,1,0,6">
-                        <ComboBoxItem Content="Flash-restore (focus target, return to you)" IsSelected="True"/>
-                        <ComboBoxItem Content="Foreground (bring target to front)"/>
+                        <ComboBoxItem Content="Focus target (bring to front, keep it focused)" IsSelected="True"/>
+                        <ComboBoxItem Content="Focus target (repeat-friendly, re-focus each run)"/>
                         <ComboBoxItem Content="Background (no focus - Win32 apps only)"/>
                     </ComboBox>
 
@@ -874,7 +874,7 @@ function Set-AutoUiState($ctx, [string]$state) {
             $ctx.BtnAutoPlay.Content = [char]0x25A0 + " Stop"
             $ctx.BtnAutoPlay.Background = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(214,66,66))
             $ctx.BtnAutoRecord.IsEnabled = $false
-            $ctx.AutoHint.Text = "Playing... click Stop to halt. Auto-stops when done or on safety limit."
+            $ctx.AutoHint.Text = "Playing... the target is focused - don't use mouse/keyboard until done. Click Stop to halt."
         }
         default {
             $ctx.AutoDot.Fill = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(102,102,102))
