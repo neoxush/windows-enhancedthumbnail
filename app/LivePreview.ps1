@@ -840,6 +840,85 @@ function Hide-TitleBar($ctx) {
 }
 
 # ============================================================
+# Automate panel auto-sizing
+#
+# When the Automate flyout opens it needs vertical room for its full content
+# (target line, macro list, options, action row, and the status/log box). The
+# panel row is Auto-sized so its content never clips internally, but the WINDOW
+# height was not grown to make room - so the panel squeezed the preview and the
+# user had to drag the window taller to reveal the log area. These helpers grow
+# the window by the panel's measured height on open and restore it on close,
+# giving a native auto-fit instead of manual dragging.
+# ============================================================
+function Get-AutomatePanelHeight($ctx) {
+    # Force a layout pass so the (now-visible) panel reports a real height, then
+    # return its rendered/desired height in device-independent pixels.
+    try {
+        $ctx.AutomatePanel.UpdateLayout()
+        $h = $ctx.AutomatePanel.ActualHeight
+        if (-not $h -or $h -le 0) {
+            $ctx.AutomatePanel.Measure([System.Windows.Size]::new($ctx.AutomatePanel.ActualWidth, [double]::PositiveInfinity))
+            $h = $ctx.AutomatePanel.DesiredSize.Height
+        }
+        return [double]$h
+    } catch { return 0.0 }
+}
+
+function Expand-ForAutomatePanel($ctx) {
+    # Grow the window so the freshly-opened panel gets its full height without
+    # eating the preview area. Idempotent: only grows once per open.
+    if ($ctx.AutoPanelExpanded) { return }
+    $panelH = Get-AutomatePanelHeight $ctx
+    if ($panelH -le 0) { return }
+    $ctx.AutoPanelSavedHeight = $ctx.Window.Height
+    $ctx.AutoPanelSavedMinHeight = $ctx.Window.MinHeight
+    $required = $ctx.Window.ActualHeight + $panelH
+    # Relax MinHeight if it would block growth, then grow to fit.
+    if ($ctx.Window.MinHeight -gt $required) { $ctx.Window.MinHeight = $required }
+    if ($required -gt $ctx.Window.Height) { $ctx.Window.Height = $required }
+    $ctx.AutoPanelExpanded = $true
+    Update-Thumbnail $ctx
+}
+
+function Update-AutomateFit($ctx) {
+    # Re-fit the window while the panel is already open (e.g. after the Settings
+    # sub-panel expands/collapses and changes the panel's height). Recomputes
+    # from the saved pre-open height so growth never compounds.
+    if (-not $ctx.AutoPanelExpanded) { return }
+    if (-not ($ctx.ContainsKey('AutoPanelSavedHeight') -and $ctx.AutoPanelSavedHeight)) { return }
+    $panelH = Get-AutomatePanelHeight $ctx
+    if ($panelH -le 0) { return }
+    # Base = the window height WITHOUT the panel = savedHeight's content minus
+    # nothing (savedHeight already excluded the panel). Required = base + panel.
+    $baseHeight = [double]$ctx.AutoPanelSavedHeight
+    $required = $baseHeight + $panelH
+    if ($ctx.Window.MinHeight -gt $required) { $ctx.Window.MinHeight = $required }
+    $ctx.Window.Height = $required
+    Update-Thumbnail $ctx
+}
+
+function Collapse-AfterAutomatePanel($ctx) {
+    # Restore the pre-open window height when the panel closes.
+    # Also reset the Settings sub-panel to collapsed so it never lingers open
+    # into the next time the Automate panel is called up (Settings is a
+    # transient toggle, not a persistent state).
+    if ($ctx.SettingsPanel) {
+        $ctx.SettingsPanel.Visibility = [System.Windows.Visibility]::Collapsed
+    }
+    if (-not $ctx.AutoPanelExpanded) { return }
+    if ($ctx.ContainsKey('AutoPanelSavedMinHeight') -and $ctx.AutoPanelSavedMinHeight) {
+        $ctx.Window.MinHeight = $ctx.AutoPanelSavedMinHeight
+        $ctx.AutoPanelSavedMinHeight = $null
+    }
+    if ($ctx.ContainsKey('AutoPanelSavedHeight') -and $ctx.AutoPanelSavedHeight) {
+        $ctx.Window.Height = $ctx.AutoPanelSavedHeight
+        $ctx.AutoPanelSavedHeight = $null
+    }
+    $ctx.AutoPanelExpanded = $false
+    Update-Thumbnail $ctx
+}
+
+# ============================================================
 # Automate feature helpers (drive MacroTool.ps1 as a background job)
 # ============================================================
 function Refresh-AutoMacros($ctx) {
@@ -1138,6 +1217,9 @@ function New-PreviewWindow {
         SetAutoCollapse = $wnd.FindName("SetAutoCollapse")
         AutoPanelScale  = $wnd.FindName("AutoPanelScale")
         AutoBusy        = $null   # 'record' | 'play' | $null
+        AutoPanelExpanded    = $false   # window grown to fit the Automate panel
+        AutoPanelSavedHeight = $null    # window height before the panel opened
+        AutoPanelSavedMinHeight = $null # MinHeight before the panel opened
         ThumbnailHandle = [IntPtr]::Zero
         TargetHandle    = [IntPtr]::Zero
         TargetTitle     = ""
@@ -1269,6 +1351,7 @@ function New-PreviewWindow {
         $c = Get-Ctx $sender
         if ($c.AutomatePanel.Visibility -eq [System.Windows.Visibility]::Visible) {
             $c.AutomatePanel.Visibility = [System.Windows.Visibility]::Collapsed
+            Collapse-AfterAutomatePanel $c
         } else {
             if (-not $script:MacroToolAvailable) {
                 $c.AutoStatus.Text = "MacroTool.ps1 not found next to LivePreview.ps1."
@@ -1280,6 +1363,9 @@ function New-PreviewWindow {
                 $c.AutoHint.Text = "Recording stops with $(Get-StopKeyName $script:RecordStopVk). Playback auto-stops when done or on safety limit."
             }
             Refresh-AutoMacros $c
+            # Grow the window so the whole panel (incl. the log area) fits without
+            # the user having to drag-resize.
+            Expand-ForAutomatePanel $c
         }
     })
 
@@ -1345,6 +1431,9 @@ function New-PreviewWindow {
             $c.SetAutoCollapse.IsChecked = $script:AutoCollapseOnPlay
             $c.SettingsPanel.Visibility = [System.Windows.Visibility]::Visible
         }
+        # The settings sub-panel changed the Automate panel's height - re-fit
+        # (or fit for the first time if the panel was just opened above).
+        if ($c.AutoPanelExpanded) { Update-AutomateFit $c } else { Expand-ForAutomatePanel $c }
     })
 
     $ctx.BtnSettingsSave.Add_Click({
@@ -1362,6 +1451,8 @@ function New-PreviewWindow {
             }
             # Save also closes the settings sub-panel.
             $c.SettingsPanel.Visibility = [System.Windows.Visibility]::Collapsed
+            # Re-fit now that the settings sub-panel collapsed.
+            if ($c.AutoPanelExpanded) { Update-AutomateFit $c }
         } else {
             $c.SetHint.Text = "Pick a key first."
         }
@@ -1401,6 +1492,7 @@ function New-PreviewWindow {
         # Optionally collapse the macro panel after starting playback (opt-in setting).
         if ($script:AutoCollapseOnPlay) {
             $c.AutomatePanel.Visibility = [System.Windows.Visibility]::Collapsed
+            Collapse-AfterAutomatePanel $c
         }
     })
 
