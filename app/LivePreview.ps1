@@ -130,6 +130,7 @@ $script:AutoMaxRuntime = 300
 $script:SettingsPath = Join-Path $PSScriptRoot 'settings.json'
 $script:RecordStopVk = 0x78   # default F9
 $script:AutoCollapseOnPlay = $false   # off by default; collapse macro panel after Play
+$script:LastMacro = ''   # last macro that was played; restored when the panel first opens
 
 # Friendly labels for the shortcut dropdown. Order here defines the UI order.
 $script:StopKeyChoices = [ordered]@{
@@ -159,6 +160,9 @@ function Load-Settings {
             if ($s -and ($s.PSObject.Properties.Name -contains 'autoCollapseOnPlay')) {
                 $script:AutoCollapseOnPlay = [bool]$s.autoCollapseOnPlay
             }
+            if ($s -and ($s.PSObject.Properties.Name -contains 'lastMacro')) {
+                $script:LastMacro = [string]$s.lastMacro
+            }
         } catch {
             Write-Host "  [!] Could not read settings.json - using defaults." -ForegroundColor Yellow
         }
@@ -167,7 +171,7 @@ function Load-Settings {
 
 function Save-Settings {
     try {
-        [ordered]@{ recordStopVk = [int]$script:RecordStopVk; autoCollapseOnPlay = [bool]$script:AutoCollapseOnPlay } |
+        [ordered]@{ recordStopVk = [int]$script:RecordStopVk; autoCollapseOnPlay = [bool]$script:AutoCollapseOnPlay; lastMacro = [string]$script:LastMacro } |
             ConvertTo-Json | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
     } catch {
         Write-Host "  [!] Could not write settings.json." -ForegroundColor Yellow
@@ -921,7 +925,7 @@ function Collapse-AfterAutomatePanel($ctx) {
 # ============================================================
 # Automate feature helpers (drive MacroTool.ps1 as a background job)
 # ============================================================
-function Refresh-AutoMacros($ctx) {
+function Refresh-AutoMacros($ctx, [switch]$RestoreLast) {
     $ctx.AutoMacro.Items.Clear()
     if (-not $script:MacroToolAvailable) { return }
     try {
@@ -931,6 +935,12 @@ function Refresh-AutoMacros($ctx) {
             $names = $json | ConvertFrom-Json
             foreach ($nm in @($names)) { [void]$ctx.AutoMacro.Items.Add($nm) }
             if ($ctx.AutoMacro.Items.Count -eq 1) { $ctx.AutoMacro.SelectedIndex = 0 }
+            # Restore the remembered macro (last one played) only when asked -
+            # e.g. when the Automate panel first opens. The plain Refresh button
+            # passes through without re-selecting.
+            elseif ($RestoreLast -and $script:LastMacro -and $ctx.AutoMacro.Items.Contains($script:LastMacro)) {
+                $ctx.AutoMacro.SelectedItem = $script:LastMacro
+            }
         }
     } catch {
         $ctx.AutoStatus.Text = "Could not list macros: $($_.Exception.Message)"
@@ -1486,7 +1496,7 @@ function New-PreviewWindow {
             if (-not $c.AutoBusy) {
                 $c.AutoHint.Text = "Recording stops with $(Get-StopKeyName $script:RecordStopVk). Playback auto-stops when done or on safety limit."
             }
-            Refresh-AutoMacros $c
+            Refresh-AutoMacros $c -RestoreLast
             # Grow the window so the whole panel (incl. the log area) fits without
             # the user having to drag-resize.
             Expand-ForAutomatePanel $c
@@ -1613,6 +1623,12 @@ function New-PreviewWindow {
         $hwnd = [int64]$c.TargetHandle
         $args = "play -Name `"$macro`" -TargetHwnd $hwnd -Delay $delay -Repeat $repeat -Interval $interval -Speed $speed$modeFlag"
         Start-AutoJob $c $args "Playback" 'play'
+        # Remember this macro as the last-used one so it is re-selected next time
+        # the Automate panel is opened (persisted to settings.json).
+        if ("" + $macro -ne $script:LastMacro) {
+            $script:LastMacro = "" + $macro
+            Save-Settings
+        }
         # Optionally collapse the macro panel after starting playback (opt-in setting).
         if ($script:AutoCollapseOnPlay) {
             $c.AutomatePanel.Visibility = [System.Windows.Visibility]::Collapsed
