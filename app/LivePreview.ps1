@@ -498,8 +498,12 @@ public class NativeMethods {
                             <Ellipse Name="AutoDot" Width="9" Height="9" Fill="#666666"
                                      DockPanel.Dock="Left"
                                      VerticalAlignment="Top" Margin="0,3,6,0"/>
-                            <TextBlock Name="AutoStatus" Text="Idle." Foreground="#B8F0B8" FontSize="10"
-                                       FontFamily="Consolas" TextWrapping="Wrap" MinHeight="30"/>
+                            <ScrollViewer Name="AutoStatusScroll" Height="72"
+                                          VerticalScrollBarVisibility="Auto"
+                                          HorizontalScrollBarVisibility="Disabled">
+                                <TextBlock Name="AutoStatus" Text="Idle." Foreground="#B8F0B8" FontSize="10"
+                                           FontFamily="Consolas" TextWrapping="Wrap"/>
+                            </ScrollViewer>
                         </DockPanel>
                     </Border>
                     <!-- Hint text display area disabled for now.
@@ -1238,8 +1242,8 @@ function Start-AutoJob($ctx, [string]$macroArgs, [string]$label, [string]$kind) 
             if (Test-Path $c.AutoJobLog) {
                 $lines = Get-Content -LiteralPath $c.AutoJobLog -ErrorAction SilentlyContinue
                 if ($lines) {
-                    $tail = ($lines | Select-Object -Last 6) -join "`n"
-                    $c.AutoStatus.Text = $tail
+                    $c.AutoStatus.Text = ($lines -join "`n")
+                    if ($c.AutoStatusScroll) { $c.AutoStatusScroll.ScrollToBottom() }
                     # EXPERIMENTAL: derive a compact tab-view badge from the same log.
                     try { Update-AutoTabBadge $c $lines } catch {}
                 }
@@ -1252,7 +1256,7 @@ function Start-AutoJob($ctx, [string]$macroArgs, [string]$label, [string]$kind) 
             $c.AutoJobProc = $null
             Remove-Item -LiteralPath $c.AutoJobLog -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath ($c.AutoJobLog + ".err") -Force -ErrorAction SilentlyContinue
-            $c.AutoStatus.Text = ($c.AutoStatus.Text + "`n[finished]")
+            # $c.AutoStatus.Text = ($c.AutoStatus.Text + "`n[finished]")
             # EXPERIMENTAL: flash a transient "done" badge, then auto-hide.
             try { Show-AutoTabDone $c } catch {}
             Set-AutoUiState $c 'idle'
@@ -1353,6 +1357,7 @@ function New-PreviewWindow {
         BtnAutoRefresh  = $wnd.FindName("BtnAutoRefresh")
         BtnAutoFolder   = $wnd.FindName("BtnAutoFolder")
         AutoStatus      = $wnd.FindName("AutoStatus")
+        AutoStatusScroll = $wnd.FindName("AutoStatusScroll")
         AutoDot         = $wnd.FindName("AutoDot")
         AutoTabBadge    = $wnd.FindName("AutoTabBadge")
         AutoTabStatus   = $wnd.FindName("AutoTabStatus")
