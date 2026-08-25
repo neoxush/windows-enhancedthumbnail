@@ -502,8 +502,11 @@ public class NativeMethods {
                                        FontFamily="Consolas" TextWrapping="Wrap" MinHeight="30"/>
                         </DockPanel>
                     </Border>
-                    <TextBlock Name="AutoHint" Text="Recording stops with the configured shortcut. Playback auto-stops when done or on safety limit."
+                    <!-- Hint text display area disabled for now.
+                    <TextBlock Name="AutoHint" Text=""
                                Foreground="#777777" FontSize="9" TextWrapping="Wrap" Margin="0,3,0,0"/>
+                    -->
+                    <TextBlock Name="AutoHint" Visibility="Collapsed"/>
                 </StackPanel>
             </Border>
 
@@ -926,6 +929,10 @@ function Collapse-AfterAutomatePanel($ctx) {
 # Automate feature helpers (drive MacroTool.ps1 as a background job)
 # ============================================================
 function Refresh-AutoMacros($ctx, [switch]$RestoreLast) {
+    # Remember what was selected before we rebuild the list so the user's chosen
+    # macro survives a refresh/replay for the lifetime of this tab. Clearing
+    # Items wipes the selection, so we re-apply it afterwards.
+    $prevSelection = "" + $ctx.AutoMacro.SelectedItem
     $ctx.AutoMacro.Items.Clear()
     if (-not $script:MacroToolAvailable) { return }
     try {
@@ -935,6 +942,12 @@ function Refresh-AutoMacros($ctx, [switch]$RestoreLast) {
             $names = $json | ConvertFrom-Json
             foreach ($nm in @($names)) { [void]$ctx.AutoMacro.Items.Add($nm) }
             if ($ctx.AutoMacro.Items.Count -eq 1) { $ctx.AutoMacro.SelectedIndex = 0 }
+            # Preserve the current selection across a refresh (e.g. after playback
+            # finishes) so the dropdown never returns to an empty state while the
+            # chosen macro still exists.
+            elseif ($prevSelection -and $ctx.AutoMacro.Items.Contains($prevSelection)) {
+                $ctx.AutoMacro.SelectedItem = $prevSelection
+            }
             # Restore the remembered macro (last one played) only when asked -
             # e.g. when the Automate panel first opens. The plain Refresh button
             # passes through without re-selecting.
@@ -973,7 +986,7 @@ function Set-AutoUiState($ctx, [string]$state) {
             $ctx.BtnAutoPlay.Content = [char]0x25B6 + " Play"
             $ctx.BtnAutoPlay.Background = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromRgb(66,102,214))
             $ctx.BtnAutoPlay.IsEnabled = $true
-            $ctx.AutoHint.Text = "Recording stops with $(Get-StopKeyName $script:RecordStopVk). Playback auto-stops when done or on safety limit."
+            $ctx.AutoHint.Text = ""
         }
     }
 }
@@ -1494,7 +1507,7 @@ function New-PreviewWindow {
             if ($c.TargetTitle) { $c.AutoTarget.Text = "Target: $($c.TargetTitle)" }
             else { $c.AutoTarget.Text = "Target: (select a window first)" }
             if (-not $c.AutoBusy) {
-                $c.AutoHint.Text = "Recording stops with $(Get-StopKeyName $script:RecordStopVk). Playback auto-stops when done or on safety limit."
+                $c.AutoHint.Text = "Recording stops with $(Get-StopKeyName $script:RecordStopVk)."
             }
             Refresh-AutoMacros $c -RestoreLast
             # Grow the window so the whole panel (incl. the log area) fits without
@@ -1581,7 +1594,7 @@ function New-PreviewWindow {
             $c.SetHint.Text = "Saved. Recording now stops with $label."
             # Refresh the Automate hint if idle so it reflects the new key.
             if (-not $c.AutoBusy) {
-                $c.AutoHint.Text = "Recording stops with $label. Playback auto-stops when done or on safety limit."
+                $c.AutoHint.Text = "Recording stops with $label."
             }
             # Save also closes the settings sub-panel.
             $c.SettingsPanel.Visibility = [System.Windows.Visibility]::Collapsed
