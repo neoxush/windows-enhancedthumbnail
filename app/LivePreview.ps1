@@ -131,6 +131,12 @@ $script:SettingsPath = Join-Path $PSScriptRoot 'settings.json'
 $script:RecordStopVk = 0x78   # default F9
 $script:AutoCollapseOnPlay = $false   # off by default; collapse macro panel after Play
 $script:LastMacro = ''   # last macro that was played; restored when the panel first opens
+# Coordinate capture mode for NEW recordings:
+#   $false = absolute screen pixels (legacy; breaks if the window is moved/resized)
+#   $true  = window-relative (client-area fractions; survives moving/resizing/DPI)
+# Playback auto-detects each macro's own stored coordMode, so this only affects
+# what gets written when you RECORD. Off by default to preserve legacy behavior.
+$script:RelativeCoords = $false
 
 # Friendly labels for the shortcut dropdown. Order here defines the UI order.
 $script:StopKeyChoices = [ordered]@{
@@ -163,6 +169,9 @@ function Load-Settings {
             if ($s -and ($s.PSObject.Properties.Name -contains 'lastMacro')) {
                 $script:LastMacro = [string]$s.lastMacro
             }
+            if ($s -and ($s.PSObject.Properties.Name -contains 'relativeCoords')) {
+                $script:RelativeCoords = [bool]$s.relativeCoords
+            }
         } catch {
             Write-Host "  [!] Could not read settings.json - using defaults." -ForegroundColor Yellow
         }
@@ -171,7 +180,7 @@ function Load-Settings {
 
 function Save-Settings {
     try {
-        [ordered]@{ recordStopVk = [int]$script:RecordStopVk; autoCollapseOnPlay = [bool]$script:AutoCollapseOnPlay; lastMacro = [string]$script:LastMacro } |
+        [ordered]@{ recordStopVk = [int]$script:RecordStopVk; autoCollapseOnPlay = [bool]$script:AutoCollapseOnPlay; lastMacro = [string]$script:LastMacro; relativeCoords = [bool]$script:RelativeCoords } |
             ConvertTo-Json | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
     } catch {
         Write-Host "  [!] Could not write settings.json." -ForegroundColor Yellow
@@ -426,6 +435,10 @@ public class NativeMethods {
                                        Foreground="#777777" FontSize="9" TextWrapping="Wrap" Margin="0,4,0,0"/>
                             <CheckBox Name="SetAutoCollapse" Content="Auto-collapse this panel after Play"
                                       Foreground="#CCCCCC" FontSize="10" Margin="0,6,0,0"/>
+                            <CheckBox Name="SetRelativeCoords" Content="Window-relative recording (survives moving/resizing)"
+                                      Foreground="#CCCCCC" FontSize="10" Margin="0,6,0,0"/>
+                            <TextBlock Text="When on, new recordings anchor clicks to the target window's client area instead of fixed screen pixels."
+                                       Foreground="#777777" FontSize="9" TextWrapping="Wrap" Margin="0,2,0,0"/>
                         </StackPanel>
                     </Border>
                     <TextBlock Name="AutoTarget" Text="Target: (none)" Foreground="#AAAAAA"
@@ -1363,6 +1376,7 @@ function New-PreviewWindow {
         AutoTabStatus   = $wnd.FindName("AutoTabStatus")
         AutoHint        = $wnd.FindName("AutoHint")
         SetAutoCollapse = $wnd.FindName("SetAutoCollapse")
+        SetRelativeCoords = $wnd.FindName("SetRelativeCoords")
         AutoPanelScale  = $wnd.FindName("AutoPanelScale")
         AutoBusy        = $null   # 'record' | 'play' | $null
         AutoPanelExpanded    = $false   # window grown to fit the Automate panel
@@ -1565,7 +1579,7 @@ function New-PreviewWindow {
     $ctx.SetStopKey.SelectedItem = (Get-StopKeyName $script:RecordStopVk)
     if ($null -eq $ctx.SetStopKey.SelectedItem) { $ctx.SetStopKey.SelectedIndex = 0 }
     $ctx.SetAutoCollapse.IsChecked = $script:AutoCollapseOnPlay
-
+    $ctx.SetRelativeCoords.IsChecked = $script:RelativeCoords
     $ctx.BtnSettings.Add_Click({
         param($sender, $e)
         $c = Get-Ctx $sender
@@ -1581,6 +1595,7 @@ function New-PreviewWindow {
         } else {
             $c.SetStopKey.SelectedItem = (Get-StopKeyName $script:RecordStopVk)
             $c.SetAutoCollapse.IsChecked = $script:AutoCollapseOnPlay
+            $c.SetRelativeCoords.IsChecked = $script:RelativeCoords
             $c.SettingsPanel.Visibility = [System.Windows.Visibility]::Visible
         }
         # The settings sub-panel changed the Automate panel's height - re-fit
@@ -1595,8 +1610,10 @@ function New-PreviewWindow {
         if ($script:StopKeyChoices.Contains($label)) {
             $script:RecordStopVk = [int]$script:StopKeyChoices[$label]
             $script:AutoCollapseOnPlay = [bool]$c.SetAutoCollapse.IsChecked
+            $script:RelativeCoords = [bool]$c.SetRelativeCoords.IsChecked
             Save-Settings
-            $c.SetHint.Text = "Saved. Recording now stops with $label."
+            $coordNote = if ($script:RelativeCoords) { " Recordings are window-relative." } else { " Recordings use absolute coordinates." }
+            $c.SetHint.Text = "Saved. Recording now stops with $label.$coordNote"
             # Refresh the Automate hint if idle so it reflects the new key.
             if (-not $c.AutoBusy) {
                 $c.AutoHint.Text = "Recording stops with $label."
@@ -1618,7 +1635,18 @@ function New-PreviewWindow {
         if ($c.AutoBusy) { $c.AutoStatus.Text = "A $($c.AutoBusy) job is already running."; return }
         $name = ("" + $c.AutoRecName.Text).Trim()
         if (-not $name) { $c.AutoStatus.Text = "Enter a macro name first."; return }
-        Start-AutoJob $c ("record -Name `"$name`"") "Recording" 'record'
+        # Window-relative recording: anchor to the previewed window's client area so
+        # the macro survives the window being moved/resized. Needs a real target
+        # handle; if none is selected we fall back to absolute recording.
+        $recArgs = "record -Name `"$name`""
+        if ($script:RelativeCoords) {
+            if ($c.TargetHandle -ne [IntPtr]::Zero) {
+                $recArgs += " -Relative -TargetHwnd $([int64]$c.TargetHandle)"
+            } else {
+                $c.AutoStatus.Text = "Relative mode: select a window first, or turn it off in Settings. Recording absolute."
+            }
+        }
+        Start-AutoJob $c $recArgs "Recording" 'record'
     })
 
     $ctx.BtnAutoPlay.Add_Click({

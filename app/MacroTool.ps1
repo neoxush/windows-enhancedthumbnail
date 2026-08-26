@@ -43,6 +43,15 @@ param(
 
     [switch]$NoMove,
 
+    # RELATIVE (window-anchored) macros. When set on `record`, mouse points are
+    # stored as fractions of the target window's CLIENT area (fx,fy in 0..1) so
+    # playback can re-project them onto the window's CURRENT client rect - this
+    # survives the window being moved, resized, or the resolution/DPI changing
+    # (as long as the app's layout scales proportionally). When set on `play`,
+    # it forces relative projection; otherwise the macro's own stored 'coordMode'
+    # is honored. Zero-dependency (GetClientRect/ClientToScreen only).
+    [switch]$Relative,
+
     [switch]$Json,
 
     [switch]$Background,
@@ -190,6 +199,23 @@ if (-not ([System.Management.Automation.PSTypeName]'Win32.Native').Type) {
 
     [DllImport("user32.dll")]
     public static extern bool ScreenToClient(IntPtr hWnd, ref POINT lpPoint);
+
+    // Window/client geometry for RELATIVE (window-anchored) macros. GetWindowRect
+    // returns screen coords of the whole window; GetClientRect returns the client
+    // area in client coords (0,0 origin) so its .Right/.Bottom are width/height;
+    // ClientToScreen maps a client point back to screen coords. All user32.dll -
+    // no new dependency.
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
 
     [DllImport("user32.dll")]
     public static extern IntPtr WindowFromPoint(POINT p);
@@ -421,14 +447,17 @@ function Get-MacroPath([string]$n) {
     Join-Path $script:MacrosDir $n
 }
 
-function Save-Macro([string]$n, $events) {
+function Save-Macro([string]$n, $events, [string]$coordMode = 'absolute') {
     if (-not (Test-Path $script:MacrosDir)) {
         New-Item -ItemType Directory -Path $script:MacrosDir | Out-Null
     }
     $obj = [ordered]@{
-        name    = $n
-        created = (Get-Date).ToString('s')
-        events  = $events
+        name      = $n
+        created   = (Get-Date).ToString('s')
+        # 'absolute' = legacy screen-pixel coords (x,y). 'relative' = each mouse
+        # event also carries fx,fy fractions of the client area for re-projection.
+        coordMode = $coordMode
+        events    = $events
     }
     $obj | ConvertTo-Json -Depth 6 | Set-Content -Path (Get-MacroPath $n) -Encoding UTF8
 }
@@ -437,6 +466,37 @@ function Load-Macro([string]$n) {
     $path = Get-MacroPath $n
     if (-not (Test-Path $path)) { throw "Macro not found: $path" }
     Get-Content -Path $path -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+# --------------------------------------------------------------------------
+# Relative-coordinate anchoring (window client area, in SCREEN pixels).
+# --------------------------------------------------------------------------
+# Returns @{ ox; oy; w; h } describing the target window's CLIENT area in screen
+# coordinates: (ox,oy) is the client top-left on screen, (w,h) its pixel size.
+# Used to (a) normalize recorded clicks to fractions at record time and
+# (b) re-project those fractions onto the current client rect at play time.
+# Returns $null if the handle is invalid or the client area is degenerate.
+function Get-ClientAnchor([IntPtr]$hWnd) {
+    if ($hWnd -eq [IntPtr]::Zero -or -not [Win32.Native]::IsWindow($hWnd)) { return $null }
+    $cr = New-Object Win32.Native+RECT
+    if (-not [Win32.Native]::GetClientRect($hWnd, [ref]$cr)) { return $null }
+    $w = $cr.Right - $cr.Left
+    $h = $cr.Bottom - $cr.Top
+    if ($w -le 0 -or $h -le 0) { return $null }
+    # Map client-space origin (0,0) to screen coordinates.
+    $origin = New-Object Win32.Native+POINT
+    $origin.X = 0; $origin.Y = 0
+    if (-not [Win32.Native]::ClientToScreen($hWnd, [ref]$origin)) { return $null }
+    return @{ ox = [int]$origin.X; oy = [int]$origin.Y; w = [int]$w; h = [int]$h }
+}
+
+# Project a normalized point (fx,fy in 0..1 of the client area) back to an
+# absolute screen pixel using the CURRENT client anchor.
+function Convert-FractionToScreen($anchor, [double]$fx, [double]$fy) {
+    return @{
+        x = [int][math]::Round($anchor.ox + $fx * $anchor.w)
+        y = [int][math]::Round($anchor.oy + $fy * $anchor.h)
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -752,7 +812,35 @@ function Send-Wheel([int]$dx, [int]$dy) {
 # Virtual key codes we watch for button state.
 $MOUSE_VKS = @{ 0x01 = 'left'; 0x02 = 'right'; 0x04 = 'middle' }  # VK_LBUTTON/RBUTTON/MBUTTON
 
-function Invoke-Record([string]$n, [bool]$recordMoves) {
+function Invoke-Record([string]$n, [bool]$recordMoves, [IntPtr]$anchorHwnd = [IntPtr]::Zero) {
+    # RELATIVE recording: if a target window handle is supplied, anchor every
+    # mouse point to that window's client area (fractions in 0..1). The anchor is
+    # sampled ONCE at record start; playback re-derives the live rect. If the
+    # handle is bad we transparently fall back to absolute recording.
+    $relative = $false
+    $anchor = $null
+    if ($anchorHwnd -ne [IntPtr]::Zero) {
+        $anchor = Get-ClientAnchor $anchorHwnd
+        if ($anchor) {
+            $relative = $true
+            Write-Host ("Relative mode: anchored to window 0x{0:X} client {1}x{2} @ ({3},{4})." -f `
+                [int64]$anchorHwnd, $anchor.w, $anchor.h, $anchor.ox, $anchor.oy) -ForegroundColor Cyan
+        } else {
+            Write-Host "[warn] -Relative requested but the target window client area is unavailable; recording ABSOLUTE." -ForegroundColor DarkYellow
+        }
+    }
+
+    # Attach fx,fy fractions to a mouse-event ordered-map when recording relative.
+    # (x,y absolute are still stored so absolute playback / debugging stays easy.)
+    $addFrac = {
+        param($ev, $sx, $sy)
+        if ($relative) {
+            $ev.fx = [math]::Round((($sx - $anchor.ox) / [double]$anchor.w), 6)
+            $ev.fy = [math]::Round((($sy - $anchor.oy) / [double]$anchor.h), 6)
+        }
+        return $ev
+    }
+
     Write-Host ("Recording... press {0} to stop." -f (Get-VkName $VK_STOP)) -ForegroundColor Yellow
     $events = New-Object System.Collections.ArrayList
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -787,10 +875,10 @@ function Invoke-Record([string]$n, [bool]$recordMoves) {
         # accurate, distinct timings instead of collapsing to one poll tick.
         $wdx = 0; $wdy = 0; $wx = 0; $wy = 0; $wt = 0.0
         while ([Win32.WheelHook]::TryDequeue([ref]$wdx, [ref]$wdy, [ref]$wx, [ref]$wy, [ref]$wt)) {
-            [void]$events.Add([ordered]@{
+            [void]$events.Add((& $addFrac ([ordered]@{
                 t = [math]::Round($wt, 4); type = 'mouse_scroll'
                 dx = $wdx; dy = $wdy; x = $wx; y = $wy
-            })
+            }) $wx $wy))
         }
 
         # mouse buttons
@@ -800,10 +888,10 @@ function Invoke-Record([string]$n, [bool]$recordMoves) {
             if ($down -ne $prevBtn[$name]) {
                 $pt = New-Object Win32.Native+POINT
                 [void][Win32.Native]::GetCursorPos([ref]$pt)
-                [void]$events.Add([ordered]@{
+                [void]$events.Add((& $addFrac ([ordered]@{
                     t = [math]::Round($t, 4); type = 'mouse_click'
                     button = $name; pressed = $down; x = $pt.X; y = $pt.Y
-                })
+                }) $pt.X $pt.Y))
                 $prevBtn[$name] = $down
             }
         }
@@ -832,7 +920,7 @@ function Invoke-Record([string]$n, [bool]$recordMoves) {
             $pt = New-Object Win32.Native+POINT
             [void][Win32.Native]::GetCursorPos([ref]$pt)
             if ($pt.X -ne $lastPt.X -or $pt.Y -ne $lastPt.Y) {
-                [void]$events.Add([ordered]@{ t=[math]::Round($t,4); type='mouse_move'; x=$pt.X; y=$pt.Y })
+                [void]$events.Add((& $addFrac ([ordered]@{ t=[math]::Round($t,4); type='mouse_move'; x=$pt.X; y=$pt.Y }) $pt.X $pt.Y))
                 $lastPt = $pt
                 $lastMoveT = $t
             }
@@ -848,7 +936,8 @@ function Invoke-Record([string]$n, [bool]$recordMoves) {
 
     Write-Host ("Recording stopped. Captured {0} events." -f $events.Count) -ForegroundColor Green
     if ($events.Count -gt 0) {
-        Save-Macro $n $events
+        $coordMode = if ($relative) { 'relative' } else { 'absolute' }
+        Save-Macro $n $events $coordMode
         Write-Host ("Saved to {0}" -f (Get-MacroPath $n)) -ForegroundColor Green
     } else {
         Write-Host "No events captured; nothing saved."
@@ -872,9 +961,23 @@ function Get-KeyRepeatIntervalMs {
     return 33
 }
 
-function Invoke-PlayEvents($events, [double]$speed) {
+function Invoke-PlayEvents($events, [double]$speed, $anchor = $null) {
     if ($speed -le 0) { $speed = 1.0 }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+    # RELATIVE playback: when an $anchor (client area in current screen coords) is
+    # supplied, each mouse point is re-projected from its stored fraction (fx,fy)
+    # onto the LIVE client rect, so a moved/resized window still gets accurate
+    # clicks. Events without fx/fy (or when $anchor is null) fall back to their
+    # absolute x,y. Resolve the effective screen point here so all three mouse
+    # branches share one code path.
+    $resolveXY = {
+        param($ev)
+        if ($anchor -and ($null -ne $ev.fx) -and ($null -ne $ev.fy)) {
+            return Convert-FractionToScreen $anchor ([double]$ev.fx) ([double]$ev.fy)
+        }
+        return @{ x = [int]$ev.x; y = [int]$ev.y }
+    }
 
     # Does this macro itself use Esc? If so, the raw GetAsyncKeyState(Esc) panic
     # key would false-trigger the instant we INJECT the macro's own Esc, aborting
@@ -921,13 +1024,15 @@ function Invoke-PlayEvents($events, [double]$speed) {
         }
 
         switch ($ev.type) {
-            'mouse_move'  { Move-MouseAbsolute $ev.x $ev.y }
+            'mouse_move'  { $p = & $resolveXY $ev; Move-MouseAbsolute $p.x $p.y }
             'mouse_scroll' {
-                Move-MouseAbsolute $ev.x $ev.y
+                $p = & $resolveXY $ev
+                Move-MouseAbsolute $p.x $p.y
                 Send-Wheel ([int]$ev.dx) ([int]$ev.dy)
             }
             'mouse_click' {
-                Move-MouseAbsolute $ev.x $ev.y
+                $p = & $resolveXY $ev
+                Move-MouseAbsolute $p.x $p.y
                 $down = $ev.pressed
                 switch ($ev.button) {
                     'left'   { $f = if ($down) { $MOUSEEVENTF_LEFTDOWN }   else { $MOUSEEVENTF_LEFTUP } }
@@ -1129,10 +1234,27 @@ function Show-Countdown([double]$seconds, [string]$label) {
     if ($seconds -gt 0) { Write-Host ("`r" + (' ' * 40) + "`r") -NoNewline }
 }
 
-function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, [double]$interval, [double]$speed, [bool]$background, [bool]$flashRestore, [IntPtr]$explicitHwnd = [IntPtr]::Zero) {
+function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, [double]$interval, [double]$speed, [bool]$background, [bool]$flashRestore, [IntPtr]$explicitHwnd = [IntPtr]::Zero, [bool]$forceRelative = $false) {
     $macro = Load-Macro $n
     $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
     if (-not $proc) { Write-Host "[error] PID $targetPid not found." -ForegroundColor Red; return }
+
+    # Decide whether to play back in RELATIVE (window-anchored) mode. Honor the
+    # macro's stored coordMode, or an explicit -Relative override. Relative needs
+    # a concrete window handle to anchor to; without one we can't re-project, so
+    # we warn and fall back to absolute. Background mode already remaps to client
+    # coords via its own path, so relative anchoring only applies to foreground.
+    $macroMode = ''
+    try { $macroMode = [string]$macro.coordMode } catch { $macroMode = '' }
+    $wantRelative = ($forceRelative -or $macroMode -eq 'relative')
+    $useRelative = $false
+    if ($wantRelative -and -not $background) {
+        if ($explicitHwnd -ne [IntPtr]::Zero) {
+            $useRelative = $true
+        } else {
+            Write-Host "[warn] Relative playback needs -TargetHwnd; falling back to ABSOLUTE coordinates." -ForegroundColor DarkYellow
+        }
+    }
     $modeLabel = if ($background) { 'BACKGROUND (no focus)' } else { 'FOREGROUND (focus target, keep it in front)' }
     Write-Host ("Target: PID {0} ({1})  Mode: {2}" -f $targetPid, $proc.ProcessName, $modeLabel)
 
@@ -1226,7 +1348,17 @@ function Invoke-Play([string]$n, [int]$targetPid, [double]$delay, [int]$repeat, 
         if ($background) {
             $ok = Invoke-PlayEventsBackground $macro.events $speed $bgHwnd
         } else {
-            $ok = Invoke-PlayEvents $macro.events $speed
+            # Sample the target's CURRENT client anchor right before each run so a
+            # window moved/resized between runs is tracked live. Null anchor =>
+            # Invoke-PlayEvents falls back to absolute coords automatically.
+            $anchor = $null
+            if ($useRelative) {
+                $anchor = Get-ClientAnchor $explicitHwnd
+                if (-not $anchor) {
+                    Write-Host "[warn] Could not read target client rect this run; using absolute coords." -ForegroundColor DarkYellow
+                }
+            }
+            $ok = Invoke-PlayEvents $macro.events $speed $anchor
         }
         if (-not $ok) {
             return
@@ -1451,7 +1583,19 @@ switch ($Command) {
     'checkenv' { Invoke-CheckEnv }
     'record' {
         if (-not $Name) { throw "record requires -Name" }
-        Invoke-Record $Name (-not $NoMove.IsPresent)
+        # Relative recording needs a window to anchor to. Prefer an explicit
+        # -TargetHwnd; if -Relative was requested without one, anchor to whatever
+        # window is currently foreground (best-effort) so the CLI stays usable.
+        $recHwnd = [IntPtr]::Zero
+        if ($Relative.IsPresent) {
+            if ($TargetHwnd -ne 0) {
+                $recHwnd = [IntPtr]$TargetHwnd
+            } else {
+                $recHwnd = [Win32.Native]::GetForegroundWindow()
+                Write-Host ("Relative: no -TargetHwnd given; anchoring to current foreground window 0x{0:X}." -f [int64]$recHwnd) -ForegroundColor DarkCyan
+            }
+        }
+        Invoke-Record $Name (-not $NoMove.IsPresent) $recHwnd
     }
     'play' {
         if (-not $Name) { throw "play requires -Name" }
@@ -1462,7 +1606,7 @@ switch ($Command) {
             $TargetPid = [int]$rpid
         }
         if (-not $TargetPid)  { throw "play requires -TargetPid or -TargetHwnd" }
-        Invoke-Play $Name $TargetPid $Delay $Repeat $Interval $Speed $Background.IsPresent $FlashRestore.IsPresent ([IntPtr]$TargetHwnd)
+        Invoke-Play $Name $TargetPid $Delay $Repeat $Interval $Speed $Background.IsPresent $FlashRestore.IsPresent ([IntPtr]$TargetHwnd) $Relative.IsPresent
     }
     'list' { Invoke-List }
     'pids' {

@@ -294,7 +294,33 @@ Not required for the PowerShell toolkit.
 
 ## 版本历史 / Version History
 
-### v1.1.0 (Latest)
+### v1.2.0 (Latest)
+- **新功能**：**窗口相对录制（可选）**——录制时将鼠标点击存为目标窗口客户区的相对比例
+  （`fx,fy`），回放时再投影到窗口的“当前”客户区。这样即使目标窗口被**移动、缩放，或
+  分辨率/DPI 改变**，宏也不会失效（前提是程序界面按比例缩放）。旧的绝对坐标宏照常回放。
+- **UI**：Automate ▸ 设置面板新增 **“窗口相对录制（可容忍移动/缩放）”** 复选框
+  （持久化为 `relativeCoords`）。开启后 Record 会附带 `-Relative -TargetHwnd`；回放会
+  自动识别每个宏保存的 `coordMode`，无需额外设置。
+- **兼容性**：相对模式为**默认关闭**的可选项；已有的绝对坐标宏行为完全不变。
+- **CLI**：`record -Name x -Relative -TargetHwnd 0x…`。
+- 依旧零外部依赖（仅新增 `user32.dll` 的 `GetWindowRect`/`GetClientRect`/`ClientToScreen`）。
+
+- **Feature**: **Window-relative recording (opt-in)** — clicks are stored as
+  fractions of the target window's client area (`fx,fy`) and re-projected onto the
+  window's *current* client rect at playback. Macros now survive the target window
+  being **moved, resized, or the resolution/DPI changing** (as long as the app's
+  layout scales proportionally). Legacy absolute macros still replay unchanged.
+- **UI**: New **"Window-relative recording (survives moving/resizing)"** checkbox
+  in the Automate ▸ Settings panel (persisted as `relativeCoords`). When on, Record
+  passes `-Relative -TargetHwnd`; playback auto-detects each macro's stored
+  `coordMode`, so no extra step is needed to replay.
+- **Compatibility**: Relative mode is **opt-in (off by default)**; existing
+  absolute macros behave exactly as before.
+- **CLI**: `record -Name x -Relative -TargetHwnd 0x…`.
+- Still zero external dependencies (adds only `GetWindowRect`/`GetClientRect`/
+  `ClientToScreen` from `user32.dll`).
+
+### v1.1.0
 - **修复**：回放时不再因目标窗口失焦而“盲点”——每次运行前校验目标进程/窗口存活，
   并确认目标已在前台（按 PID 匹配），否则跳过该次运行，避免误点到其它窗口（如导致
   Chrome 被意外关闭）。
