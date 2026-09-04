@@ -65,7 +65,7 @@ param(
     [int]$StopVk = 0x78,
 
     # Auto-stop safety nets:
-    [double]$MaxRuntime = 300,   # hard wall-clock cap in seconds (0 = unlimited)
+    [double]$MaxRuntime = 3600,   # hard wall-clock cap in seconds (0 = unlimited)
     [int]$WatchPid = 0           # if this PID (the launching UI) exits, stop playback
 )
 

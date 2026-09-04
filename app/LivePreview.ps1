@@ -120,7 +120,7 @@ $script:MacroToolPath = Join-Path $PSScriptRoot 'MacroTool.ps1'
 $script:MacroToolAvailable = Test-Path $script:MacroToolPath
 # Auto-stop: hard wall-clock cap (seconds) for any single playback job. A runaway
 # or infinite-repeat macro can never run longer than this. Adjust if needed.
-$script:AutoMaxRuntime = 300
+$script:AutoMaxRuntime = 3600
 
 # --------------------------------------------------------------------------
 # Persisted settings (settings.json next to the scripts).
